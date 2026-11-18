@@ -1,3 +1,4 @@
+import { cancelActiveTurn } from "../agent/turn-delivery.mjs";
 import { runWithPostAnswer } from "../agent/post-answer.mjs";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -39,6 +40,7 @@ export async function handleSessions({ req, res, url, app, ctx }) {
     }
 
     if (action === "messages" && req.method === "POST") {
+      const body = await readJson(req);
       // A legacy prompt must not be injected into an active AG-UI run: it would
       // be queued as a followUp and its events would leak into that run.
       if (entry.agui?.isRunning) {
@@ -48,7 +50,6 @@ export async function handleSessions({ req, res, url, app, ctx }) {
           threadId: entry.id,
         });
       }
-      const body = await readJson(req);
       const text = String(body.text || "").trim();
       const attachments = Array.isArray(body.attachments) ? body.attachments : [];
       if (!text && !attachments.length) return json(res, 400, { error: "empty message" });
@@ -58,11 +59,6 @@ export async function handleSessions({ req, res, url, app, ctx }) {
         .map((item) => path.relative(ctx.root, path.resolve(ctx.root, item)))
         .filter((item) => item && !item.startsWith(".."));
 
-      let promptText = text || "看一下这几个文件。";
-      if (safeAttachments.length) {
-        promptText += `\n\n[已上传资料]\n${safeAttachments.map((item) => `- ${item}`).join("\n")}`;
-      }
-
       if (entry.title === "新会话" || !entry.title) {
         const title = makeTitle(text);
         entry.title = title;
@@ -71,7 +67,7 @@ export async function handleSessions({ req, res, url, app, ctx }) {
 
       entry.updatedAt = nowIso();
       const streaming = Boolean(entry.session.isStreaming || entry.postAnswerPending);
-      const run = runWithPostAnswer(entry, promptText, {}, event => broadcast(entry, event));
+      const run = runWithPostAnswer(entry, text || "看一下这几个文件。", { attachments: safeAttachments }, event => broadcast(entry, event));
       run.catch((error) => {
         broadcast(entry, { type: "run.error", message: error?.message || String(error) });
       });
@@ -88,10 +84,9 @@ export async function handleSessions({ req, res, url, app, ctx }) {
     }
 
     if (action === "abort" && req.method === "POST") {
-      // Keep both abort entry points identical: adapter.abort() stops the AG-UI
-      // stream immediately, then lets Pi settle.
+      // Cancellation also applies while Pi is idle between verification attempts.
       if (entry.agui?.isRunning) await entry.agui.abort();
-      else await entry.session.abort();
+      else await cancelActiveTurn(entry);
       return json(res, 200, { ok: true });
     }
 

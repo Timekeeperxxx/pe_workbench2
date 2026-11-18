@@ -18,6 +18,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 
+import { recoverInterruptedTurns, cancelActiveTurn } from "./turn-delivery.mjs";
 import { runWithPostAnswer } from "./post-answer.mjs";
 import { PiAgUiAdapter } from "../../lib/agent-protocol/pi-ag-ui-adapter.mjs";
 import { createFakeSession } from "./fake-agent.mjs";
@@ -213,6 +214,7 @@ export function createSessionService({
       unsubscribe: null,
       localRunId: null,
     };
+    if (restoredManager && !entry.automated) recoverInterruptedTurns(entry);
     entry.snapshot = () => serializeSession(entry);
     attachSessionEvents(entry, { bus, onMaterialSaved, onRunSettled });
     entry.agui = new PiAgUiAdapter({
@@ -221,12 +223,17 @@ export function createSessionService({
       workspaceId: ctx.id,
       log: ctx.agentEvents,
       isBusy: () => Boolean(entry.postAnswerPending),
-      promptRunner: (text, options) => runWithPostAnswer(entry, text, options, event => bus.broadcast(entry, event)),
+      ...(entry.automated ? {} : {
+        promptRunner: (text, options) => runWithPostAnswer(entry, text, options, event => bus.broadcast(entry, event)),
+        cancelTurn: () => cancelActiveTurn(entry),
+      }),
     });
     entry.agui.attach();
     live.set(entry.id, entry);
     return entry;
   }
+
+  const loading = new Map();
 
   async function ensureEntry(id, ctx = null, scope = {}) {
     const existing = live.get(id);
@@ -238,7 +245,12 @@ export function createSessionService({
     const candidates = ctx ? [ctx] : projectManager.list();
     for (const candidate of candidates) {
       const file = SessionManager.findById(candidate.root, id, candidate.sessionsDir);
-      if (file) return createEntry({ id, file, ctx: candidate, ...scope });
+      if (file) {
+        if (!loading.has(file)) {
+          loading.set(file, createEntry({ id, file, ctx: candidate, ...scope }).finally(() => loading.delete(file)));
+        }
+        return loading.get(file);
+      }
     }
     return null;
   }

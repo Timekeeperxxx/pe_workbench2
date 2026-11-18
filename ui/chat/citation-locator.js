@@ -20,7 +20,8 @@ const SIMPLE_SHEET = String.raw`[A-Za-z0-9_\u4e00-\u9fff]+`;
 const CELL = String.raw`\$?[A-Za-z]{1,3}\$?\d{1,7}`;
 const SHEET = `(?:${QUOTED_SHEET}|${MULTI_WORD_SHEET}|${SIMPLE_SHEET})`;
 
-export const LOCATOR_SOURCE = `${SHEET}!${CELL}(?::${CELL})?(?![A-Za-z0-9_:])`;
+const QUALIFIER = String.raw`\[([^\[\]\r\n]+)\]`;
+export const LOCATOR_SOURCE = `(?:${QUALIFIER})?${SHEET}!${CELL}(?::${CELL})?(?![A-Za-z0-9_:])`;
 
 function locatorRegExp(flags = "g") {
   return new RegExp(LOCATOR_SOURCE, flags);
@@ -59,7 +60,7 @@ function parseCoord(coord) {
  * The returned citation keeps the anchor cell's material and version, but its
  * locator stays the range so the preview opens the written start cell.
  */
-function coveredRangeCitation(locator, lookup) {
+function coveredRangeCitation(locator, lookup, source) {
   if (!lookup?.get) return null;
   const bang = locator.indexOf("!");
   if (bang <= 0) return null;
@@ -76,14 +77,15 @@ function coveredRangeCitation(locator, lookup) {
   const colHi = Math.max(start.col, end.col);
   const count = (rowHi - rowLo + 1) * (colHi - colLo + 1);
   if (count < 2 || count > RANGE_CELL_CAP) return null;
+  const anchor = lookup.get(`${sheet}!${start.coord}`.toLowerCase(), source);
+  if (!anchor?.materialId) return null;
   for (let row = rowLo; row <= rowHi; row += 1) {
     for (let col = colLo; col <= colHi; col += 1) {
       const key = `${sheet}!${columnLetters(col)}${row}`.toLowerCase();
-      if (!lookup.get(key)) return null;
+      const cell = lookup.get(key, source);
+      if (!cell || citationIdentity(cell) !== citationIdentity(anchor)) return null;
     }
   }
-  const anchor = lookup.get(`${sheet}!${start.coord}`.toLowerCase());
-  if (!anchor?.materialId) return null;
   const version = Number(anchor.version);
   return {
     materialId: anchor.materialId,
@@ -92,11 +94,9 @@ function coveredRangeCitation(locator, lookup) {
   };
 }
 
-function resolveNormalized(token, normalized, lookup) {
-  const exact = lookup?.get?.(normalized.toLowerCase());
-  if (exact) return { raw: token, locator: normalized, citation: exact };
-  const covered = coveredRangeCitation(normalized, lookup);
-  if (covered) return { raw: token, locator: normalized, citation: covered };
+function resolveNormalized(token, normalized, lookup, source) {
+  const citation = lookup?.get?.(normalized.toLowerCase(), source) || coveredRangeCitation(normalized, lookup, source);
+  if (citation) return { raw: token, locator: normalized, source, citation };
   return null;
 }
 
@@ -127,6 +127,47 @@ export function locatorKey(raw) {
   return normalized ? normalized.toLowerCase() : null;
 }
 
+export function citationIdentity(citation) {
+  return `${citation.materialId}@v${citation.version ?? 0}`;
+}
+
+export function citationQualifiers(citation) {
+  return ['', citation.materialId, citationIdentity(citation), ...(citation.filename
+    ? [citation.filename, `${citation.filename}@v${citation.version}`] : [])].map(alias => alias.toLowerCase());
+}
+
+export function citationLookup(citations) {
+  const byLocator = new Map();
+  for (const citation of Array.isArray(citations) ? citations : []) {
+    const key = locatorKey(citation?.locator);
+    if (!key || !citation.materialId) continue;
+    if (!byLocator.has(key)) byLocator.set(key, new Map());
+    const matches = byLocator.get(key);
+    const identity = citationIdentity(citation);
+    if (!matches.has(identity)) matches.set(identity, citation);
+  }
+  const matchesFor = (key, qualifier) => {
+    const matches = byLocator.get(key);
+    if (!matches) return [];
+    const cells = [...matches.values()];
+    return qualifier ? cells.filter(cell => citationQualifiers(cell).includes(qualifier)) : cells;
+  };
+  const isBlocked = (cell, qualifier) => cell.ambiguousQualifiers?.includes(qualifier);
+  return {
+    size: byLocator.size,
+    isAmbiguous(key, source = '') {
+      const qualifier = source.toLowerCase();
+      const matches = matchesFor(key, qualifier);
+      return matches.length > 1 || matches.some(cell => isBlocked(cell, qualifier));
+    },
+    get(key, source = '') {
+      const qualifier = source.toLowerCase();
+      const matches = matchesFor(key, qualifier);
+      return matches.length === 1 && !isBlocked(matches[0], qualifier) ? matches[0] : undefined;
+    },
+  };
+}
+
 /** Return every locator-shaped token, including duplicates, with positions. */
 export function extractLocatorMatches(text) {
   const source = String(text ?? "");
@@ -134,7 +175,7 @@ export function extractLocatorMatches(text) {
   const matches = [];
   const regex = locatorRegExp("g");
   for (const match of source.matchAll(regex)) {
-    const normalized = normalizeLocator(match[0]);
+    const normalized = normalizeLocator(match[1] ? match[0].slice(match[1].length + 2) : match[0]);
     if (!normalized) continue;
     matches.push({
       raw: match[0],
@@ -151,10 +192,12 @@ export function resolveLocatorToken(raw, lookup = null) {
   const match = String(raw ?? "").match(locatorRegExp("i"));
   if (!match) return null;
   const token = match[0];
-  let normalized = normalizeLocator(token);
+  const source = match[1];
+  const normalized = normalizeLocator(source ? token.slice(source.length + 2) : token);
   if (!normalized) return null;
-  const exact = resolveNormalized(token, normalized, lookup);
+  const exact = resolveNormalized(token, normalized, lookup, source);
   if (exact) return exact;
+  if (source) return { raw: token, locator: normalized, source, citation: null };
   // A long prose prefix ("revenue in Discount PE!H33") is not part of the
   // sheet name. Retry with the trailing two words when the full key is
   // unknown; this keeps the unverified marker tight without guessing a cell.

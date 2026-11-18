@@ -22,10 +22,11 @@ await run;
 assert.equal(prompts.length, 3); // one correction and one continuation, never loop
 assert.equal(entry.postAnswerPending, false);
 assert(records.length >= 3);
-assert(records.every(x => x.type === 'pe_answer_lint'));
-assert(events.some(x => x.type === 'answer.lint'));
-assert.equal(records.at(-1).data.correctionCount, 1);
-assert.equal(records.at(-1).data.continuationCount, 1);
+assert.equal(records.filter(x => x.type === 'pe_answer_lint').length, 3);
+assert.equal(records.filter(x => x.type === 'pe_turn_delivery').length, 1);
+assert(!events.some(x => x.type === 'answer.lint'));
+assert.equal(records.filter(x => x.type === 'pe_answer_lint').at(-1).data.correctionCount, 1);
+assert.equal(records.filter(x => x.type === 'pe_answer_lint').at(-1).data.continuationCount, 1);
 const aborted = { session: { messages: [{ role: 'assistant', stopReason: 'aborted', content: '截断' }], async prompt() {} } };
 await runWithPostAnswer(aborted, '用户');
 assert.equal(aborted.answerLint, undefined);
@@ -44,14 +45,14 @@ const pi = {
     this.isStreaming = true;
     for (const fn of listeners) fn({ type: 'agent_start' });
     if (calls === 2) await internalGate;
-    const message = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: calls === 1 ? '100→120，增长30%。' : '100→120，增长20%。' }] };
+    const message = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: calls === 1 ? '100→120，增长30%。' : '复核完成。' }] };
     this.messages.push(message);
     for (const fn of listeners) fn({ type: 'message_end', message });
     this.isStreaming = false;
     for (const fn of listeners) fn({ type: 'agent_settled', aborted: false });
   },
 };
-const host = { session: pi };
+const host = { session: pi, snapshot() { throw new Error('fixture: tool-card store unavailable'); } };
 const frames = [];
 const adapter = new PiAgUiAdapter({ session: pi, threadId: 'test', workspaceId: 'test', log: { append(record) { frames.push(record.event); return record; } }, promptRunner: (text, options) => runWithPostAnswer(host, text, options) });
 await adapter.runPrompt('问题');
@@ -59,10 +60,15 @@ await new Promise(resolve => setTimeout(resolve, 10));
 assert(adapter.isRunning);
 assert(host.postAnswerPending);
 assert(!frames.some(frame => frame.type === 'RUN_FINISHED'));
+const finishing = host.postAnswerRun;
 unblock();
+const delivered = await finishing;
+assert.equal(delivered.status, 'completed');
+assert.equal(delivered.text, '复核完成。');
 await new Promise(resolve => setTimeout(resolve, 10));
 assert(!adapter.isRunning);
 assert.equal(frames.filter(frame => frame.type === 'RUN_FINISHED').length, 1);
+assert.deepEqual(frames.filter(frame => frame.type === 'TEXT_MESSAGE_CONTENT').at(-1)?.delta, '复核完成。');
 adapter.detach();
 console.log('AG-UI post answer lifecycle passed');
 const split = { session: {
@@ -156,7 +162,7 @@ await second;
 assert.equal(queued.postAnswerPending, false);
 assert.equal(correctionCalls, 2);
 assert.equal(new Set(queuedRecords.map(x => x.turnId)).size, 2);
-assert(queuedRecords.every(x => x.correctionCount <= 1 && x.continuationCount <= 1));
+assert(queuedRecords.filter(x => x.findings).every(x => x.correctionCount <= 1 && x.continuationCount <= 1));
 console.log('queued user turn caps passed');
 const finalFrames = [];
 const notify = { session: { messages: [], async prompt() { this.messages.push({ role: 'assistant', stopReason: 'stop', content: '完成。' }); } } };
@@ -182,7 +188,9 @@ const failCorrection = { session: { messages: [], async prompt() {
   if (++failCalls > 1) throw new Error('correction failed');
   this.messages.push({ role: 'assistant', stopReason: 'stop', content: '7293 百万元合 7.3 亿元。' });
 } } };
-await assert.rejects(runWithPostAnswer(failCorrection, '问题'), /correction failed/);
+const correctionFailure = await runWithPostAnswer(failCorrection, '问题');
+assert.equal(correctionFailure.status, 'failed');
+assert.match(correctionFailure.reason, /correction failed/);
 assert.equal(failCorrection.postAnswerPending, false);
 assert.equal(failCalls, 2);
 console.log('abort and failure cleanup passed');
@@ -216,6 +224,8 @@ assert.equal(hidden.session.messages.filter(m=>m.role==='user').length,1);
 assert.equal(customRequests[0].message.customType,'pe_turn_context');
 assert.equal(customRequests[0].options.deliverAs,'nextTurn');
 assert.equal(customRequests[1].message.customType,'pe_answer_correct');
+assert.match(customRequests[1].message.content, /用户还没有看到这份草稿/);
+assert.equal(customRequests[1].message.content.includes('给出修正后的完整回答'), false);
 assert.equal(customRequests[1].options.triggerTurn,true);
 assert(customRequests.every(r=>r.message.display===false));
 assert.deepEqual(hidden.answerLint.findings,[]);
@@ -292,7 +302,7 @@ const checklistSession={messages:[],sessionManager:{appendCustomEntry:(_t,d)=>ch
 const checklistEntry={id:'s',ctx:{},session:checklistSession};
 await runWithPostAnswer(checklistEntry,'问题',{requiredSections:['结论','风险']});
 assert.equal(checklistSession.messages.length,2,'checklist enables exactly one correction');
-assert.ok(checklistRecords[0].findings.some(f=>f.rule==='missing_section'));
+assert.ok(checklistRecords.find(r => r.findings).findings.some(f=>f.rule==='missing_section'));
 assert.equal(checklistEntry.answerLint.correctionCount,1);
 assert.equal(checklistEntry.answerLint.findings.length,0);
 const noChecklist={messages:[],async prompt(){this.messages.push({role:'assistant',stopReason:'stop',content:'# 结论\n内容。'});}};
@@ -397,3 +407,198 @@ assert.match(priorPrompts[1], /SOTP!J134|752/);
 assert.match(priorPrompts[1], /752/);
 assert.equal(priorEntry.answerLint.citations.length, 0, 'prior citations must not satisfy current-turn locator checks');
 console.log('target deviation post-answer correction passed');
+
+// A real Pi JSONL branch with deterministic model attempts. Only the provider is simulated.
+{
+  const { execFileSync } = await import('node:child_process');
+  const { saveTurnDelivery } = await import('../server/agent/turn-delivery.mjs');
+  const suiteRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'pe-delivery-'));
+
+  async function runScript(steps) {
+    const manager = SessionManager.create(suiteRoot, suiteRoot);
+    const messages = [];
+    const listeners = new Set();
+    const requests = [];
+    let attempts = 0;
+    function emit(event) { for (const fn of listeners) fn(event); }
+    function append(message) {
+      message.timestamp = Date.now();
+      messages.push(message);
+      manager.appendMessage(message);
+      emit({ type: 'message_end', message });
+    }
+    function generate() {
+      const step = steps[attempts++];
+      assert.ok(step, 'model received an unexpected retry');
+      emit({ type: 'agent_start' });
+      try {
+        if (step.error) throw new Error(step.error);
+        if (step.citations || step.toolError) {
+          const toolCallId = 'tool-' + attempts;
+          const toolName = 'workbook_query';
+          append({ role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: toolCallId, name: toolName, arguments: {} }] });
+          emit({ type: 'tool_execution_start', toolCallId, toolName, args: {} });
+          const result = {
+            role: 'toolResult', toolName, toolCallId, isError: Boolean(step.toolError),
+            content: [{ type: 'text', text: step.toolError || 'ok' }], details: { citations: step.citations || [] },
+          };
+          append(result);
+          emit({ type: 'tool_execution_end', toolCallId, toolName, result, isError: result.isError });
+        }
+        if (step.text !== undefined) append({
+          role: 'assistant', stopReason: step.stopReason || 'stop', errorMessage: step.errorMessage,
+          content: [{ type: 'text', text: step.text }],
+        });
+      } finally {
+        emit({ type: 'agent_settled', aborted: step.stopReason === 'aborted' });
+      }
+    }
+
+    const session = {
+      messages, sessionManager: manager,
+      subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+      async prompt(text) {
+        append({ role: 'user', content: text });
+        generate();
+      },
+      async sendCustomMessage(message, options) {
+        requests.push(message);
+        messages.push({ role: 'custom', ...message });
+        manager.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+        if (options.triggerTurn) generate();
+      },
+    };
+    const entry = { id: manager.getSessionId(), ctx: { root: suiteRoot }, session };
+    const record = await runWithPostAnswer(entry, '请回答问题。');
+    assert.equal(attempts, steps.length, 'bounded attempts');
+    const metadata = type => manager.getBranch().filter(item => item.type === 'custom' && item.customType === type).map(item => item.data);
+    assert.deepEqual(metadata('pe_turn_delivery'), [record]);
+    assert.deepEqual(metadata('pe_turn_started').map(item => item.turnId), [record.turnId]);
+    assert.ok(record.turnId);
+    assert.ok(requests.every(message => message.details.turnId === record.turnId));
+    assert.ok(metadata('pe_answer_lint').every(item => item.turnId === record.turnId));
+    return { record, metadata, requests, entry, manager };
+  }
+
+  try {
+    // A first question interrupted before Pi appends a model-visible user
+    // message already has a recoverable JSONL and one stable terminal result.
+    const { startTurn, recoverInterruptedTurns, turnTimeline } = await import('../server/agent/turn-delivery.mjs');
+    const preparing = SessionManager.create(suiteRoot, suiteRoot);
+    startTurn({ session: { sessionManager: preparing } }, { turnId: 'early', question: '首个问题。', startedAt: new Date().toISOString() });
+    const restoredManager = SessionManager.open(preparing.getSessionFile());
+    const interruptedEntry = { session: { sessionManager: restoredManager } };
+    recoverInterruptedTurns(interruptedEntry);
+    recoverInterruptedTurns(interruptedEntry);
+    const decisions = turnTimeline(interruptedEntry.session).filter(item => item.kind === 'delivery');
+    assert.deepEqual(decisions.map(item => item.record.status), ['failed']);
+
+    // Pi adds entries to its branch before the filesystem append. A failed
+    // append followed by a retry must not turn an in-memory draft into truth.
+    const shaky = SessionManager.create(suiteRoot, suiteRoot);
+    const shakyEntry = { session: { sessionManager: shaky } };
+    startTurn(shakyEntry, { turnId: 'disk', question: '写入重试', startedAt: new Date().toISOString() });
+    const persist = shaky._persist.bind(shaky);
+    let failWrite = true;
+    shaky._persist = item => {
+      if (failWrite && item.customType === 'pe_turn_delivery') { failWrite = false; throw new Error('temporary disk error'); }
+      persist(item);
+    };
+    const diskRecord = { turnId: 'disk', status: 'completed', text: '已保存。', citations: [] };
+    saveTurnDelivery(shakyEntry, diskRecord);
+    assert.deepEqual(turnTimeline({ sessionManager: SessionManager.open(shaky.getSessionFile()) })
+      .filter(item => item.kind === 'delivery').map(item => item.record), [diskRecord]);
+
+    const oldCite = { id: 'old', materialId: 'm', version: 1, locator: 'Model!A1' };
+    const newCite = { id: 'new', materialId: 'm', version: 1, locator: 'Model!B2', value: 35, display_unit: '亿元' };
+    const corrected = await runScript([
+      { text: '初稿 A：见 Model!A1 和 Fake!C9。', citations: [oldCite] },
+      { text: '新稿 B：收入为35亿元，见 Model!B2。', citations: [newCite] },
+    ]);
+    assert.equal(corrected.record.text, '新稿 B：收入为35亿元，见 Model!B2。');
+    assert.equal(corrected.record.status, 'completed');
+    assert.deepEqual(corrected.record.citations.map(c => c.id), ['new']);
+    assert.equal(corrected.requests.at(-1).customType, 'pe_answer_correct');
+
+    const sameLocator = await runScript([
+      { text: '旧稿引用 Fake!C9。', citations: [{ ...newCite, id: 'old-b2', materialId: 'old-book' }] },
+      { text: '新版依据 [m]Model!B2。', citations: [newCite] },
+    ]);
+    assert.deepEqual(sameLocator.record.citations.map(c => c.id), ['new']);
+    const withRange = await runScript([{ text: '采用 Model!B2:B3、B4。', citations: [oldCite, newCite,
+      {...newCite, id: 'b3', locator: 'Model!B3'}, {...newCite, id: 'b4', locator: 'Model!B4'},
+    ] }]);
+    assert.deepEqual(withRange.record.citations.map(c => c.id), ['new', 'b3', 'b4']);
+
+    // A normal stop requires the same continuation path as a provider's hard length stop.
+    for (const stopReason of ['length', 'stop']) {
+      const split = await runScript([{ text: '这是前半段，', stopReason }, { text: '这是后半段。' }]);
+      assert.equal(split.record.text, '这是前半段，这是后半段。');
+      assert.equal(split.record.status, 'completed');
+      assert.deepEqual(split.record.citations, []);
+      assert.deepEqual(split.metadata('pe_answer_lint').at(-1).findings, []);
+      assert.equal(split.requests.at(-1).customType, 'pe_answer_continue');
+    }
+    const spaces = await runScript([{ text: 'The first ', stopReason: 'length' }, { text: 'half.' }]);
+    assert.equal(spaces.record.text, 'The first half.');
+    const echoed = await runScript([{ text: '前文，', stopReason: 'length' }, { text: '前文，结论。' }]);
+    assert.equal(echoed.record.text, '前文，结论。');
+    // The incorrect conversion exists only across the boundary; checking just the tail misses it.
+    const joined = await runScript([
+      { text: '100→120，', stopReason: 'length' }, { text: '增长30%。' },
+      { text: '增长幅度已更正。' },
+    ]);
+    assert.equal(joined.record.text, '增长幅度已更正。');
+    assert.deepEqual(joined.requests.slice(-2).map(request => request.customType), ['pe_answer_continue', 'pe_answer_correct']);
+    assert.ok(joined.metadata('pe_answer_lint').some(item => item.findings.some(f => f.rule === 'percent_change')));
+
+    const good = '收入为35亿元，见 Model!B2。';
+    const bad = '第二项为909亿元，见 Fake!C9。';
+    const mixed = await runScript([{ text: good + '\n\n' + bad, citations: [newCite] }, { text: good + '\n\n' + bad }]);
+    assert.equal(mixed.record.status, 'partial');
+    assert.ok(mixed.record.text.includes(good));
+    assert.doesNotMatch(mixed.record.text, /909|Fake!C9/);
+    assert.deepEqual(mixed.record.citations.map(c => c.id), ['new']);
+    assert.ok(mixed.record.reason, 'partial results identify the outstanding gap');
+
+    const recoveredLookup = await runScript([
+      { toolError: 'missing workbook', text: '旧稿引用 Fake!C9。' },
+      { citations: [newCite], text: good },
+    ]);
+    assert.equal(recoveredLookup.record.status, 'completed');
+    assert.deepEqual(recoveredLookup.record.citations.map(c => c.id), ['new']);
+
+    const failures = [
+      [{ text: bad }, { text: bad }],
+      [{ text: '未核验的模型片段', stopReason: 'error', errorMessage: 'provider disconnected' }],
+      [{ error: 'provider unavailable' }],
+      [{ toolError: 'workbook not found' }],
+      [{ toolError: 'workbook not found', text: '查询顺利完成。' }],
+    ];
+    for (const steps of failures) {
+      const { record } = await runScript(steps);
+      assert.equal(record.status, 'failed');
+      assert.deepEqual(record.citations, []);
+      assert.ok(record.reason);
+      assert.doesNotMatch(record.text, /909|Fake!C9|未核验的模型片段/);
+    }
+    const emptyContinuation = await runScript([{ text: good, stopReason: 'length', citations: [newCite] }, { text: '' }]);
+    assert.equal(emptyContinuation.record.status, 'partial');
+    assert.equal(emptyContinuation.record.text, good);
+    const cancelled = await runScript([{ text: '取消前未校验文字', stopReason: 'aborted' }]);
+    assert.equal(cancelled.record.status, 'cancelled');
+    assert.doesNotMatch(cancelled.record.text, /取消前未校验文字/);
+
+    await saveTurnDelivery(corrected.entry, { ...corrected.record, text: '迟到的另一稿。' });
+    assert.deepEqual(corrected.metadata('pe_turn_delivery'), [corrected.record], 'first committed result wins');
+    const restored = execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import { SessionManager } from '@earendil-works/pi-coding-agent';
+      const branch = SessionManager.open(process.argv[1]).getBranch();
+      process.stdout.write(JSON.stringify(branch.filter(e => e.customType === 'pe_turn_delivery').map(e => e.data)));
+    `, corrected.manager.getSessionFile()], { cwd: path.resolve(import.meta.dirname, '..'), encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(restored), [corrected.record], 'new process observes identical delivery');
+  } finally {
+    await fs.rm(suiteRoot, { recursive: true, force: true });
+  }
+  console.log('durable turn delivery, corrections, bounded continuations and terminal states passed');
+}
