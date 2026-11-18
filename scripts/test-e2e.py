@@ -182,7 +182,8 @@ def run(ui: UI) -> None:
         ui.send("读一下缺失的模型 [scenario:tool-error]")
         ui.page.wait_for_selector(".tool-row.error", timeout=8000, state="attached")
         ui.settle()
-        assert "工具失败" in " ".join(ui.assistant_texts())
+        assert "回答失败" in " ".join(ui.assistant_texts())
+        assert "workbook_query" in " ".join(ui.assistant_texts())
         ui.assert_no_page_errors()
 
     check("tool failure stays recoverable", tool_failure)

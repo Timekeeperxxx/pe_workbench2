@@ -40,6 +40,9 @@ export function turnTimeline(session) {
   }
   const timeline = [];
   for (const item of entries) {
+    if (item.type === "custom_message") {
+      timeline.push({ kind: "message", message: { role: "custom", customType: item.customType } });
+    }
     if (item.type === "message") timeline.push({ kind: "message", message: item.message });
     if (item.type !== "custom") continue;
     if (item.customType === START) timeline.push({ kind: "start", turn: item.data });

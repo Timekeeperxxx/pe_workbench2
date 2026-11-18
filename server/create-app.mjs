@@ -205,7 +205,7 @@ async function maybeMaterialSaved(entry, toolName, args) {
 }
 
 
-async function maybeRunSettled(entry, { changedFiles = [], aborted = false, runId = null } = {}) {
+async function maybeRunSettled(entry, { changedFiles = [], aborted = false, runId = null, text } = {}) {
   if (aborted || !entry?.ctx?.trace || !changedFiles.length) return null;
   try {
     const appended = entry.ctx.trace.recordRun({
@@ -213,7 +213,7 @@ async function maybeRunSettled(entry, { changedFiles = [], aborted = false, runI
       runId: runId || entry.agui?.activeRunId || entry.localRunId || null,
       trackingRunId: entry.trackingRun?.runId || null,
       changedFiles,
-      text: lastAssistantText(entry.session) || "",
+      text: text ?? lastAssistantText(entry.session) ?? "",
     });
     if (appended) {
       broadcastGlobal({ type: "trace.updated", entry: appended }, entry.ctx.id);

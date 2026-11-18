@@ -1,0 +1,170 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+import { applyTurnSnapshot, receiveDelivery, startTurn, wasDelivered } from '../ui/chat/turn-delivery.js';
+
+globalThis.document = { querySelector: () => null };
+globalThis.window = {};
+const { messageHTML } = await import('../ui/chat/renderer.js');
+const bootstrap = readFileSync(new URL('../ui/bootstrap.js', import.meta.url), 'utf8');
+const handlerSource = bootstrap.slice(bootstrap.indexOf('function handleServerEvent('), bootstrap.indexOf('async function refreshSnapshot('));
+const citation = { id: 'b', materialId: 'workbook-b', version: 1, locator: 'Model!B2' };
+const unused = { id: 'a', materialId: 'workbook-a', version: 1, locator: 'Model!A1' };
+const tool = { id: 'c', name: 'read', status: 'done', citations: [unused, citation] };
+
+function page() {
+  const state = { messages: [], streaming: false, live: { text: '', tools: [] } };
+  const noop = () => {};
+  const handle = vm.runInNewContext(handlerSource + '\nhandleServerEvent', {
+    state, applyTurnSnapshot, receiveDelivery, startTurn, wasDelivered, window: {}, runtime: {},
+    renderThread: noop, syncStop: noop, scheduleThread: noop, renderSessions: noop,
+    renderAllChrome: noop, scheduleSnapshotPoll: noop, updateSessionItem: noop,
+  });
+  return { state, handle };
+}
+
+for (const [status, body, label] of [
+  ['completed', 'B，见 Model!B2。', ''],
+  ['completed', '这是前半段，这是后半段。', ''],
+  ['partial', '已核验 Model!B2。', '部分完成'],
+  ['failed', '', '回答失败'],
+  ['cancelled', '', '已取消'],
+]) {
+  const turnId = 'turn-1';
+  const user = { role: 'user', text: '问题', turnId };
+  const record = { turnId, status, text: body, citations: body.includes('B2') ? [citation] : [], reason: label ? '原因' : '' };
+  const snapshot = { type: 'snapshot', activeTurnId: turnId, streaming: true,
+    messages: [user, { role: 'assistant', turnId, status: 'pending', text: '', citations: [], tools: [tool] }] };
+  const final = { type: 'snapshot', activeTurnId: null, streaming: false,
+    messages: [user, { role: 'assistant', tools: [tool], ...record }] };
+  const { handle, state } = page();
+  handle({ type: 'turn.started', turnId, question: user.text });
+  handle({ type: 'assistant.delta', turnId, delta: '初稿 A' });
+  handle({ type: 'run.settled', turnId });
+  assert.equal(state.streaming, true);
+  assert.equal(state.live.text, '');
+  handle({ type: 'tool.started', turnId, ...tool });
+  handle({ type: 'tool.started', turnId, ...tool });
+  handle({ type: 'tool.completed', turnId, ...tool });
+  assert.equal(state.live.tools.length, 1);
+  assert.equal(state.live.tools[0].status, 'done');
+  const reconnect = page();
+  reconnect.handle(snapshot);
+  assert.equal(reconnect.state.messages.length, 1);
+  assert.equal(reconnect.state.live.tools[0].status, 'done');
+
+  for (const client of [{ handle, state }, reconnect]) {
+    client.handle({ type: 'turn.delivered', record });
+    client.handle({ type: 'turn.delivered', record });
+    client.handle({ type: 'turn.started', turnId });
+    client.handle({ type: 'assistant.delta', turnId, delta: '迟到 A' });
+    client.handle(snapshot); // A poll requested before delivery resolved late.
+    const rows = client.state.messages.filter(item => item.role === 'assistant');
+    assert.equal(client.state.streaming, false);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].text, body);
+    const html = messageHTML(rows[0]);
+    assert.doesNotMatch(html, /初稿 A|迟到 A|data-material-id="workbook-a"/);
+    if (body.includes('B2')) assert.match(html, /data-material-id="workbook-b"/);
+    assert.match(html, /<details class="tool-group">/);
+    if (label) assert.ok(html.includes(label + ' · 原因'));
+    client.handle(final);
+    assert.equal(messageHTML(client.state.messages[1]), html);
+    const fresh = page();
+    fresh.handle(final);
+    assert.equal(messageHTML(fresh.state.messages[1]), html);
+  }
+}
+const legacy = messageHTML({ role: 'assistant', text: '旧答 Model!A1。', tools: [tool] });
+assert.match(legacy, /旧答/);
+assert.match(legacy, /data-material-id="workbook-a"/);
+console.log('turn delivery UI: rewrite, continuation, all terminal states, replay, refresh, tools and legacy citations passed');
+
+{
+  const { state, handle } = page();
+  const framework = text => ({ presentation: { verdict: { text } } });
+  for (const [turnId, summary] of [['framework-v1', '早先摘要'], ['plain', null], ['framework-v2', '更新摘要']]) {
+    handle({ type: 'turn.started', turnId, question: turnId });
+    handle({ type: 'turn.delivered', record: { turnId, text: '正式正文', status: 'completed',
+      ...(summary ? { analysisState: framework(summary) } : {}) } });
+  }
+  const answers = state.messages.filter(m => m.role === 'assistant').map(messageHTML);
+  assert.match(answers[0], /正式正文[\s\S]*framework-presentation[\s\S]*早先摘要/);
+  assert.doesNotMatch(answers[1], /framework-presentation/);
+  assert.match(answers[2], /正式正文[\s\S]*framework-presentation[\s\S]*更新摘要/);
+}
+
+// Drive the shipping Copilot subscriber and client. Replace its remote SDK and
+// the DOM scheduler only; the normal connect, send and finalize paths run.
+const { registerHooks } = await import('node:module');
+const { state } = await import('../ui/state/store.js');
+const { runtime } = await import('../ui/runtime.js');
+const sdk = {
+  callbacks: null, play: null,
+  agent: {
+    setMessages() {}, async detachActiveRun() {},
+    subscribe(callbacks) { sdk.callbacks = callbacks; return { unsubscribe() {} }; },
+  },
+};
+globalThis.copilotFixture = sdk;
+const stub = (code) => 'data:text/javascript,' + encodeURIComponent(code);
+const coreStub = stub(`
+export class CopilotKitCore {
+  subscribe(callbacks) { this.callbacks = callbacks; return { unsubscribe() {} }; }
+  connect() { this.callbacks.onAgentsChanged({ agents: { pi: globalThis.copilotFixture.agent } }); }
+  subscribeToAgentWithOptions() { return { unsubscribe() {} }; }
+  setProperties() {}
+  async runAgent({ runId }) { await globalThis.copilotFixture.play(runId); }
+}
+`);
+const rendererStub = stub('export function renderThread(){} export function retainLiveUntilSnapshot(){} export function scheduleThread(){}');
+const hook = registerHooks({
+  resolve(specifier, context, next) {
+    if (context.parentURL?.endsWith('/ui/copilot-pilot/client.js')) {
+      if (specifier === '@copilotkit/core') return { shortCircuit: true, url: coreStub };
+      if (specifier === '../chat/renderer.js') return { shortCircuit: true, url: rendererStub };
+    }
+    return next(specifier, context);
+  },
+});
+let CopilotPilotClient;
+try {
+  ({ CopilotPilotClient } = await import('../ui/copilot-pilot/client.js'));
+} finally {
+  hook.deregister();
+}
+state.activeSession = 's';
+state.agentTransport = 'copilotkit';
+state.streaming = false;
+state.messages = [];
+runtime.refreshSnapshot = async () => {
+  if (state.messages.some(m => m.role === 'assistant')) throw new Error('snapshot temporarily unavailable');
+};
+const client = new CopilotPilotClient();
+for (const [turnId, text] of [['turn-b', 'B，见 Model!B2。'], ['turn-full', '这是前半段，这是后半段。']]) {
+  state.messages.push({ role: 'user', text: '问题', turnId });
+  sdk.play = async runId => {
+    const fire = (name, event) => sdk.callbacks[name]({ event });
+    fire('onRunStartedEvent', { runId });
+    fire('onToolCallStartEvent', { toolCallId: 'lookup', toolCallName: 'read' });
+    fire('onToolCallEndEvent', { toolCallId: 'lookup' });
+    const content = { messageId: turnId, delta: text };
+    fire('onTextMessageContentEvent', content);
+    fire('onTextMessageContentEvent', content);
+    assert.equal(state.live.text, '');
+    assert.equal(wasDelivered(state.messages, turnId), false);
+    const record = { turnId, text, status: 'completed', citations: text.includes('B2') ? [citation] : [] };
+    fire('onCustomEvent', { name: 'pe.turn_delivery', value: record });
+    fire('onCustomEvent', { name: 'pe.turn_delivery', value: record });
+    fire('onTextMessageContentEvent', content);
+    fire('onRunFinishedEvent', { runId });
+  };
+  await client.send({ text: '问题' });
+  const rows = state.messages.filter(m => m.role === 'assistant' && m.turnId === turnId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].text, text);
+  assert.equal(rows[0].tools.length, 1);
+  assert.equal(rows[0].citations.length, text.includes('B2') ? 1 : 0);
+  assert.equal(state.streaming, false);
+}
+console.log('Copilot client: atomic delivery survives replay and a failed final snapshot');

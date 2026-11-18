@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { renderFrameworkPresentation as renderPresentation } from '../ui/chat/presentation.js';
+import { presentUserAnswer } from '../ui/chat/user-facing-answer.js';
 // Existing price fixtures belong to the turn beginning at 02:00; keep all assertions intact.
 const renderFrameworkPresentation = (state, options = {}) => renderPresentation(state, {turnStartedAt:'2026-11-03T02:00:00Z', ...options});
 const state={presentation:{verdict:{id:'verdict',text:'752 港元仅为复现值。',status:'条件判断',value_identity:'复现值'},review_items:[{id:'R1',question:'核日期<script>',reason:'时点未知',impact:'不能直接采信'}],key_drivers:[{reference_id:'A1',weight:0.6}],highlights:['verdict','R1','S1','F1','V1','missing']},assumptions:[{id:'A1',statement:'收入增长'}],sensitivities:[{id:'S1',baseline:'0',perturbation:'-5%',result:'-10 港元'}],falsifiers:[{id:'F1',threshold:'连续两季 <15%',observed:0,status:'warning',action:'复核'}],valuations:[{id:'V1',value:752,unit:'港元',formula:'SOTP',limitations:'历史缓存'}]};
@@ -190,7 +191,8 @@ assert.ok(renderPresentation(freshState,{asOf:turnOptions.asOf}).includes('现�
 
 // Exercise the actual message renderer so a lost snapshot boundary cannot silently hide current quotes.
 const messageRenderer=vm.runInNewContext(`${renderer.slice(renderer.indexOf('function messageHTML('),renderer.indexOf('let renderScheduled'))}; messageHTML`,{
-  renderFrameworkPresentation: (s, options) => renderPresentation(s,{asOf:'2026-11-03T02:10:00Z',...options}),
+  renderFrameworkPresentation: (s, options) => renderPresentation(s,{...options,asOf:options.asOf ?? '2026-11-03T02:10:00Z'}),
+  presentUserAnswer,
   renderMarkdownHTML: () => '', toolGroupHTML: () => '', reportPathsFor: () => [],
   esc: value => value, icon: () => '',
 });

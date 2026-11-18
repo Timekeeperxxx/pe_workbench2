@@ -11,6 +11,7 @@ import {
   approvalsShelfHTML, decideApproval, loadApprovals, upsertApproval,
 } from './approvals/approvals.js';
 import { toast } from './shared/toast.js';
+import { applyTurnSnapshot, receiveDelivery, startTurn, wasDelivered } from './chat/turn-delivery.js';
 import {
   openFile, closeFile, openTask, closeTask, renderFileDialog, renderTaskDialog, toggleTask, runTask,
   renderPreview, sanitizeMarkdown, loadMarked, selectVersion, restoreVersion,
@@ -432,17 +433,29 @@ function scheduleSnapshotPoll(delay = 500) {
 }
 
 function handleServerEvent(ev) {
+  if (ev.turnId && wasDelivered(state.messages, ev.turnId)) return;
   switch (ev.type) {
+    case 'turn.started':
+      if (!startTurn(state, ev)) return;
+      runtime.resetLive?.();
+      syncStop();
+      renderThread('follow');
+      break;
+    case 'turn.delivered':
+      if (!receiveDelivery(state, ev.record)) return;
+      runtime.resetLive?.();
+      syncStop();
+      renderThread('follow');
+      window.NextActions?.refresh?.();
+      break;
     case 'snapshot':
-      state.messages = ev.messages || [];
+      if (!applyTurnSnapshot(state, ev)) return;
       state.pendingMerges = ev.pendingMerges || [];
       if (Array.isArray(ev.approvals) && ev.approvals.length) {
         for (const approval of ev.approvals) {
           if (!state.approvals.some((item) => item.id === approval.id)) state.approvals.push(approval);
         }
       }
-      state.streaming = !!ev.streaming;
-      state.live = { text: '', tools: [], startedAt: ev.streaming ? Date.now() : 0 };
       // A reconnecting SSE may receive a snapshot from just before the final
       // message append. One deferred re-read makes recovery deterministic.
       scheduleSnapshotPoll(800);
@@ -462,6 +475,7 @@ function handleServerEvent(ev) {
       window.NextActions?.refresh?.();
       break;
     case 'run.started':
+      if (state.live.turnId || ev.turnId) break;
       if (!state.streaming) state.live = { text: '', tools: [], startedAt: Date.now() };
       state.streaming = true;
       syncStop();
@@ -469,14 +483,27 @@ function handleServerEvent(ev) {
       renderThread('follow');
       break;
     case 'assistant.delta':
+      if (state.live.turnId || ev.turnId) break;
       state.live.text += ev.delta || '';
       scheduleThread();
       break;
     case 'tool.started':
+      if (ev.turnId && ev.turnId !== state.live.turnId) break;
+      if (state.live.tools.some(item => item.id === ev.id)) break;
       state.live.tools.push({ id: ev.id, name: ev.name, detail: ev.detail, status: 'running', output: '' });
       scheduleThread();
       break;
+    case 'tool.updated': {
+      if (ev.turnId && ev.turnId !== state.live.turnId) break;
+      const tool = state.live.tools.find(item => item.id === ev.id && item.status === 'running');
+      if (tool) {
+        tool.output = ev.output || '';
+        scheduleThread();
+      }
+      break;
+    }
     case 'tool.completed': {
+      if (ev.turnId && ev.turnId !== state.live.turnId) break;
       const tool = state.live.tools.find(item => item.id === ev.id);
       if (tool) {
         tool.status = ev.status;
@@ -505,6 +532,7 @@ function handleServerEvent(ev) {
       break;
     }
     case 'run.settled':
+      if (state.live.turnId || ev.turnId) break;
       retainLiveUntilSnapshot();
       state.streaming = false;
       syncStop();
@@ -545,22 +573,17 @@ async function refreshSnapshot({
     const snap = await api(`/api/sessions/${id}/state`);
     if (state.activeSession !== id) return null;
     if (guard && !guard()) return null;
-    state.messages = snap.messages || [];
+    if (snap?.sessionId !== id || !Array.isArray(snap.messages) || typeof snap.streaming !== 'boolean') {
+      throw new Error('会话快照不完整');
+    }
+    if (!applyTurnSnapshot(state, snap, { forceStopped, preserveLive })) return null;
     state.pendingMerges = snap.pendingMerges || [];
     if (Array.isArray(snap.approvals)) {
       const ids = new Set(snap.approvals.map((item) => item.id));
       state.approvals = [...snap.approvals, ...state.approvals.filter((item) => !ids.has(item.id))];
     }
-    state.streaming = forceStopped ? false : !!snap.streaming;
-    if (!preserveLive) {
-      state.live = {
-        text: '',
-        tools: [],
-        startedAt: snap.streaming && !forceStopped ? Date.now() : 0,
-      };
-    }
-    if (!forceStopped && snap.streaming && watch) scheduleSnapshotPoll(700);
-    else if (!snap.streaming || !watch || forceStopped) {
+    if (state.streaming && (watch || snap.activeTurnId)) scheduleSnapshotPoll(700);
+    else {
       clearTimeout(snapshotPollTimer);
       snapshotPollTimer = null;
     }
@@ -572,6 +595,7 @@ async function refreshSnapshot({
     renderThread('follow');
     return snap;
   } catch (error) {
+    if (state.activeSession !== id || (guard && !guard())) return null;
     runtime.resetLive?.();
     scheduleThread();
     if (throwOnError) throw error;

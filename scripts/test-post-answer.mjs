@@ -1,4 +1,9 @@
 import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { createReadTool, createWriteTool } from '@earendil-works/pi-coding-agent';
+import { createFrameworkEditTool } from '../server/agent/framework-edit.mjs';
+import { appendCorrection, markArtifact } from '../lib/ledger.mjs';
+import { validateState } from '../lib/validate-state.mjs';
 const { runWithPostAnswer } = await import('../server/agent/post-answer.mjs');
 const records = [], prompts = [], events = [];
 let release;
@@ -60,15 +65,11 @@ await new Promise(resolve => setTimeout(resolve, 10));
 assert(adapter.isRunning);
 assert(host.postAnswerPending);
 assert(!frames.some(frame => frame.type === 'RUN_FINISHED'));
-const finishing = host.postAnswerRun;
 unblock();
-const delivered = await finishing;
-assert.equal(delivered.status, 'completed');
-assert.equal(delivered.text, '复核完成。');
 await new Promise(resolve => setTimeout(resolve, 10));
 assert(!adapter.isRunning);
 assert.equal(frames.filter(frame => frame.type === 'RUN_FINISHED').length, 1);
-assert.deepEqual(frames.filter(frame => frame.type === 'TEXT_MESSAGE_CONTENT').at(-1)?.delta, '复核完成。');
+assert.deepEqual(frames.filter(frame => frame.type === 'TEXT_MESSAGE_CONTENT').map(f => f.delta), ['复核完成。']);
 adapter.detach();
 console.log('AG-UI post answer lifecycle passed');
 const split = { session: {
@@ -602,3 +603,128 @@ console.log('target deviation post-answer correction passed');
   }
   console.log('durable turn delivery, corrections, bounded continuations and terminal states passed');
 }
+
+async function frameworkFixture(t) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pe-framework-delivery-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const manager = SessionManager.create(root, root);
+  const state = JSON.parse(await fs.readFile(new URL('../skills/investment-framework/assets/analysis-state.example.json', import.meta.url), 'utf8'));
+  const content = verdict => JSON.stringify({
+    ...state, presentation: { ...state.presentation, verdict: { ...state.presentation.verdict, text: verdict } },
+  }, null, 2);
+  const tools = { read: createReadTool(root), edit: createFrameworkEditTool(root, () => entry.activeTurn), write: createWriteTool(root) };
+  let calls = [];
+  let sequence = 0;
+  function append(message) {
+    const stamped = { ...message, timestamp: Date.now() };
+    session.messages.push(stamped);
+    manager.appendMessage(stamped);
+  }
+  const session = {
+    sessionManager: manager, messages: [],
+    async prompt(question) {
+      append({ role: 'user', content: question });
+      for (const [name, args] of calls) {
+        const id = 'framework-' + ++sequence;
+        append({ role: 'assistant', stopReason: 'toolUse',
+          content: [{ type: 'toolCall', id, name, arguments: args }] });
+        const result = await tools[name].execute(id, args);
+        if (name === 'read') assert.match(result.content[0].text, /Use offset=/);
+        if (name === 'edit') assert.ok(result.details.patch);
+        append({ ...result, role: 'toolResult', toolName: name, toolCallId: id, isError: false });
+      }
+      append({ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '正式回答。' }] });
+    },
+  };
+  const ctx = { root, store: { listToolPresentations: () => [], listApprovalRequests: () => [] } };
+  const id = manager.getSessionId();
+  const entry = { id, ctx, session };
+  async function deliver(toolCalls) {
+    calls = toolCalls;
+    const events = [];
+    const record = await runWithPostAnswer(entry, '请完成本轮工作。', {}, event => events.push(event));
+    assert.equal(record.status, 'completed', record.reason);
+    assert.equal(record.text, '正式回答。');
+    assert.deepEqual(events.find(event => event.type === 'turn.delivered')?.record, record);
+    return record;
+  }
+  function answers(reopen = false) {
+    const restored = reopen ? { ...entry, session: { sessionManager: SessionManager.open(manager.getSessionFile()) } } : entry;
+    return serializeSession(restored).messages.filter(m => m.role === 'assistant');
+  }
+  return { root, id, content, deliver, answers };
+}
+
+await test('real Pi paginated read and edit preserve successive framework versions in delivery', async t => {
+  const f = await frameworkFixture(t);
+  const artifact = 'exports/analysis-state.json';
+  const original = f.content('原判断');
+  assert.equal(validateState(JSON.parse(original)).ok, true);
+  await fs.mkdir(path.join(f.root, 'exports'));
+  await fs.writeFile(path.join(f.root, artifact), original);
+  const edit = (before, after, path = artifact) => ['edit', { path, edits: [{ oldText: before, newText: after }] }];
+  const piPath = '@' + artifact;
+  const first = await f.deliver([['read', { path: piPath, offset: 1, limit: 20 }], edit('原判断', '新判断', piPath)]);
+  const verdict = m => m.analysisState?.presentation.verdict.text;
+  assert.equal(JSON.parse(await fs.readFile(path.join(f.root, artifact), 'utf8')).presentation.verdict.text, '新判断');
+  assert.equal(verdict(first), '新判断');
+  assert.equal(first.analysisStatePath, artifact);
+  assert.equal(verdict(f.answers()[0]), '新判断');
+  assert.equal(verdict(f.answers(true)[0]), '新判断');
+  await f.deliver([edit('新判断', '第三版判断')]);
+  await f.deliver([]);
+  assert.deepEqual(f.answers().map(verdict), ['新判断', '第三版判断', undefined]);
+  assert.deepEqual(f.answers(true).map(verdict), ['新判断', '第三版判断', undefined]);
+});
+
+await test('a paginated edit keeps file revisions outside the patch context', async t => {
+  const f = await frameworkFixture(t);
+  const artifact = 'exports/analysis-state.json';
+  await f.deliver([['write', { path: artifact, content: f.content('原判断') }]]);
+  const updated = { ...JSON.parse(f.content('原判断')), revision: 2 };
+  await fs.writeFile(path.join(f.root, artifact), JSON.stringify(updated, null, 2));
+  const record = await f.deliver([
+    ['read', { path: artifact, offset: 1, limit: 20 }],
+    ['edit', { path: artifact, edits: [{ oldText: '原判断', newText: '新判断' }] }],
+  ]);
+  assert.equal(record.analysisState?.presentation.verdict.text, '新判断');
+  assert.equal(record.analysisState?.revision, 2);
+  assert.deepEqual(f.answers(true).map(m => m.analysisState?.revision), [1, 2]);
+});
+
+await test('history keeps a captured edit without a verdict card', async t => {
+  const f = await frameworkFixture(t);
+  const artifact = 'exports/analysis-state.json';
+  const original = f.content('原判断');
+  await f.deliver([['write', { path: artifact, content: original }]]);
+  const current = JSON.parse(original);
+  delete current.presentation.verdict;
+  await fs.writeFile(path.join(f.root, artifact), JSON.stringify(current, null, 2));
+  const record = await f.deliver([
+    ['read', { path: artifact, offset: 1, limit: 20 }],
+    ['edit', { path: artifact, edits: [{ oldText: '"revision": 1', newText: '"revision": 2' }] }],
+  ]);
+  assert.equal(Boolean(record.analysisState), false);
+  assert.deepEqual(f.answers(true).map(m => m.analysisState?.presentation.verdict?.text), ['原判断', undefined]);
+});
+
+await test('two framework cards keep their own pending corrections as of delivery', async t => {
+  const f = await frameworkFixture(t);
+  const a = 'exports/first/analysis-state.json';
+  const b = 'exports/second/analysis-state.json';
+  const correction = await appendCorrection(f.root, f.id, {
+    claim: '核对框架数据', evidence: { type: 'user', ref: '测试' }, turn: 0, from: 2, to: 3,
+  });
+  const mark = (path, status) => markArtifact(f.root, f.id, correction.id, { path, status });
+  await mark(a, 'pending_merge');
+  const write = (path, text) => [['write', { path, content: f.content(text) }]];
+  assert.equal((await f.deliver(write(a, '第一份框架。'))).analysisStatePath, a);
+  assert.equal((await f.deliver(write(b, '第二份框架。'))).analysisStatePath, b);
+  const flags = () => f.answers(true).map(m => [m.analysisStatePath, m.analysisStatePendingMerge]);
+  assert.deepEqual(flags(), [[a, true], [b, false]]);
+  await mark(a, 'merged');
+  await mark(b, 'pending_merge');
+  assert.deepEqual(flags(), [[a, true], [b, false]]);
+  await f.deliver(write(b, '第二份框架更新。'));
+  assert.deepEqual(flags(), [[a, true], [b, false], [b, true]]);
+});

@@ -1,26 +1,20 @@
 import { asLegacyFact, lintFactIdentity } from '../../lib/fact-memory/context.mjs';
 /** Shared user-turn lifecycle. Automated watch/tracking prompts never use this wrapper. */
 import { buildTurnContext, checkTurnTools } from '../../lib/turn-context.mjs';
-import { readLedger } from '../../lib/ledger.mjs';
+import { pendingMerges, readLedger, readLedgerSync } from '../../lib/ledger.mjs';
 import { recordUserClaims } from '../../lib/claim-detect.mjs';
 import { randomUUID } from 'node:crypto';
 import { lintAnswer, lintLedgerAnswer, answerStats, asksDeviationQuestion, contextModelTarget } from '../../lib/answer-lint.mjs';
 import { collectCitationsFromToolCalls, rehydrateCitations } from '../../lib/citations.mjs';
 import { markStaleVersions, registerToolResult } from '../../lib/fact-register.mjs';
-import { textOfContent } from './snapshot.mjs';
+import { frameworkForTurn, textOfContent } from './snapshot.mjs';
 import { indexJson, locateChatTopics, recentTopicDialogue } from './topic-locator.mjs';
 import { updateTopicsFromFacts } from '../../lib/topic-index.mjs';
 
 import { activateQueuedTurn, startTurn, saveTurnDelivery } from './turn-delivery.mjs';
 import { adoptedCitations, answerBlocks, answerGaps, blockingFinding, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
 import { presentUserAnswer } from '../../ui/chat/user-facing-answer.js';
-const CONTEXT_BUDGET_FAILURE = "上下文超限，没有生成回答。";
-
-function isContextBudgetError(errorMessage) {
-  const text = String(errorMessage || "");
-  if (text.includes(CONTEXT_BUDGET_FAILURE)) return true;
-  return /maximum context length|reduce the length of the messages|exceeds the context window/i.test(text);
-}
+import { CONTEXT_BUDGET_FAILURE, isContextBudgetError } from '../../lib/context-budget.mjs';
 
 export function runWithPostAnswer(entry, text, options = {}, broadcast = () => {}) {
   const { runId, attachments, ...promptOptions } = options;
@@ -47,7 +41,17 @@ export function runWithPostAnswer(entry, text, options = {}, broadcast = () => {
     }
     if (active.cancelled) outcome = { ...outcome, status: 'cancelled', reason: '用户已取消本次回答。' };
     try {
-      const record = saveTurnDelivery(entry, { version: 1, turnId: turn.turnId, ...(turn.runId ? { runId: turn.runId } : {}), finishedAt: new Date().toISOString(), ...outcome });
+      const framework = outcome.status === 'completed' || outcome.status === 'partial'
+        ? frameworkForTurn(entry.session, entry.ctx, turn.turnId, active.frameworkEdits)
+        : null;
+      const presentation = framework ? {
+        ...framework,
+        turnStartedAt: turn.startedAt,
+        analysisStatePendingMerge: pendingMerges(readLedgerSync(entry.ctx.root, entry.id))
+          .some(item => item.path === framework.analysisStatePath),
+      } : {};
+      if (!framework && active.frameworkEdits?.size) presentation.analysisState = null;
+      const record = saveTurnDelivery(entry, { version: 1, turnId: turn.turnId, ...(turn.runId ? { runId: turn.runId } : {}), finishedAt: new Date().toISOString(), ...outcome, ...presentation });
       try {
         broadcast({ type: 'turn.delivered', record });
         entry.onTurnDelivered?.(record);
@@ -68,7 +72,6 @@ export function runWithPostAnswer(entry, text, options = {}, broadcast = () => {
       // Snapshot joins (e.g. an unavailable tool-card table) cannot change
       // the already persisted decision returned to the other transport.
       try {
-        broadcast({ type: 'answer.checked' });
         if (entry.snapshot) broadcast(entry.snapshot());
       } catch (error) {
         console.warn('[chat] Could not refresh the session snapshot:', error.message);

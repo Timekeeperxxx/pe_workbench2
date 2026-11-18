@@ -32,6 +32,7 @@ export function attachAgentSubscriptions(core, agent, handlers = {}) {
     onTextMessageStartEvent: (params) => handlers.onTextMessageStartEvent?.(params),
     onTextMessageContentEvent: (params) => handlers.onTextMessageContentEvent?.(params),
     onTextMessageEndEvent: (params) => handlers.onTextMessageEndEvent?.(params),
+    onCustomEvent: (params) => handlers.onCustomEvent?.(params),
     onToolCallStartEvent: (params) => handlers.onToolCallStartEvent?.(params),
     onToolCallArgsEvent: (params) => handlers.onToolCallArgsEvent?.(params),
     onToolCallEndEvent: (params) => handlers.onToolCallEndEvent?.(params),

@@ -304,7 +304,7 @@ def run(ui: UI) -> None:
         ui.settle()
         open_tool_groups(ui)
         thread_text = ui.page.locator("#thread").inner_text()
-        assert "我先查两个地方" in thread_text, thread_text
+        assert "我先查两个地方" not in thread_text, thread_text
         assert "两处都看完了" in thread_text, thread_text
         assert tool_count(ui) >= 2, tool_count(ui)
         ui.reload_open(ui.session_id())
@@ -322,7 +322,8 @@ def run(ui: UI) -> None:
         ui.wait_first_text()
         ui.settle()
         assert ui.page.locator(".tool-row.error").count() >= 1
-        assert "工具失败" in " ".join(ui.assistant_texts())
+        assert "回答失败" in " ".join(ui.assistant_texts())
+        assert "workbook_query" in " ".join(ui.assistant_texts())
         ui.assert_no_page_errors()
 
     check("tool failure is surfaced and the session stays usable", tool_failure)
@@ -344,6 +345,30 @@ def run(ui: UI) -> None:
         ui.assert_no_page_errors(allow_network=True)
 
     check("snapshot failure keeps the completed live answer", snapshot_failure)
+
+    def reopen_after_snapshot_failure():
+        ui.reset(True)
+        ui.send("重开已有回答 [scenario:tool]")
+        ui.wait_first_text()
+        ui.settle()
+        sid = ui.session_id()
+        expected = api("GET", f"/api/sessions/{sid}/state")["messages"][-1]
+        ui.new_session()
+        pattern = f"**/api/sessions/{sid}/state?*"
+        with ui.page.expect_event("requestfailed", predicate=lambda req: f"/{sid}/state?" in req.url):
+            ui.page.route(pattern, lambda route: route.abort("internetdisconnected"), times=1)
+            ui.page.locator(f'[data-session="{sid}"]').click()
+        ui.page.evaluate("() => window.dispatchEvent(new Event('online'))")
+        ui.page.wait_for_selector(".msg.assistant .msg-body", timeout=5000)
+        assert ui.assistant_texts() == [expected["text"]]
+        actual = ui.page.evaluate("() => state.messages.filter(m => m.role === 'assistant')")
+        assert [(m["text"], m["citations"], m["status"]) for m in actual] == [
+            (expected["text"], expected["citations"], "completed")
+        ]
+        assert ui.page.locator(".workbook-card").count() == 1
+        ui.assert_no_page_errors(allow_network=True)
+
+    check("online restores a failed first history snapshot without reopening", reopen_after_snapshot_failure)
 
     print("\nagent error")
 
@@ -381,13 +406,16 @@ def run(ui: UI) -> None:
         pattern = "**/api/copilotkit/agent/pi/stop/*"
         ui.page.route(pattern, lambda route: route.abort())
         try:
-            ui.send("停止失败 [scenario:slow]")
+            ui.send("停止失败 [scenario:reconnect-long]")
             ui.page.wait_for_timeout(700)
             ui.page.click("#stopBtn")
             ui.page.wait_for_timeout(500)
             assert "停止失败" in ui.page.locator("#toast").inner_text()
             ui.settle(timeout=10000)
             assert ui.page.evaluate("() => state.streaming") is False
+            assert any("/api/copilotkit/agent/pi/connect" in request.url for request in ui.requests)
+            assert len(ui.assistant_texts()) == 1
+            assert "重连片段24" in ui.assistant_texts()[0]
         finally:
             ui.page.unroute(pattern)
         ui.errors = [error for error in ui.errors if "Failed to fetch" not in error and "net::" not in error]

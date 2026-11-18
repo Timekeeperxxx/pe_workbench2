@@ -53,7 +53,7 @@ async function send() {
   const sessionId = state.activeSession;
 
   const paths = attached.map(f => f.uploadedPath || f.relPath).filter(Boolean);
-  state.messages.push({ role: 'user', text: text || '看一下这几个文件。', time: nowHM() });
+  state.messages.push({ role: 'user', pendingDelivery: true, text: text || '看一下这几个文件。', time: nowHM() });
   state.pending = [];
   inputEl.value = '';
   autosize();
@@ -85,7 +85,7 @@ async function send() {
   }
 
   state.streaming = true;
-  state.live = { text: '', tools: [], startedAt: Date.now() };
+  if (!state.live.turnId) state.live = { text: '', tools: [], startedAt: Date.now() };
   runtime.resetLive?.();
   syncStop();
   renderThread(true);

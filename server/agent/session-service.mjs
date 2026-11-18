@@ -18,14 +18,16 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 
-import { recoverInterruptedTurns, cancelActiveTurn } from "./turn-delivery.mjs";
+import { recoverInterruptedTurns, cancelActiveTurn, turnTimeline } from "./turn-delivery.mjs";
 import { runWithPostAnswer } from "./post-answer.mjs";
+import { createFrameworkEditTool } from "./framework-edit.mjs";
 import { PiAgUiAdapter } from "../../lib/agent-protocol/pi-ag-ui-adapter.mjs";
 import { createFakeSession } from "./fake-agent.mjs";
 import { attachSessionEvents } from "./event-bridge.mjs";
 import {
   makeTitle,
   serializeSession,
+  transcriptMessages,
   titleFromMessages,
 } from "./snapshot.mjs";
 import { systemHint } from "../project-context.mjs";
@@ -151,7 +153,7 @@ export function createSessionService({
         broadcast: event => bus.broadcastGlobal(event, ctx.id),
         onChange: () => { if (entry) bus.broadcast(entry, entry.snapshot()); },
       }),
-      createTranscriptSearchTool({getMessages: () => session.messages.slice(0, entry?.transcriptBoundary ?? session.messages.length), getLedger: () => readLedger(ctx.root, session.sessionId)}),
+      createTranscriptSearchTool({getMessages: () => transcriptMessages(session, ctx, { beforeTurnId: entry?.activeTurn?.turnId, legacyBoundary: entry?.transcriptBoundary }), getLedger: () => readLedger(ctx.root, session.sessionId)}),
     ];
     if (config.fakeAgent) {
       session = await createFakeSession({ id: id || undefined, ctx, config });
@@ -169,7 +171,9 @@ export function createSessionService({
         sessionManager,
         resourceLoader: loader,
         tools: [...config.toolNames, ...sessionTools.map(t => t.name)],
-        customTools: ctx.tools.map(t=>withFactCapture(t,ctx.factMemory,metadata)).concat(sessionTools),
+        customTools: ctx.tools
+          .map(tool => withFactCapture(tool, ctx.factMemory, metadata))
+          .concat(sessionTools, createFrameworkEditTool(ctx.root, () => entry?.activeTurn)),
       });
       session = created.session;
       if (config.modelPayload) {
@@ -228,6 +232,11 @@ export function createSessionService({
         cancelTurn: () => cancelActiveTurn(entry),
       }),
     });
+    entry.recoverProtocol = () => {
+      for (const item of turnTimeline(session)) {
+        if (item.kind === "delivery" && item.record.runId) entry.agui.recoverDelivery(item.record);
+      }
+    };
     entry.agui.attach();
     live.set(entry.id, entry);
     return entry;

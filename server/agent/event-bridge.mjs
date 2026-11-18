@@ -14,22 +14,40 @@ import { validCitations } from "../../lib/contracts/citation.mjs";
 import { resultText, toolDetail } from "./snapshot.mjs";
 
 export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, onRunSettled = () => {} }) {
+  function settle(aborted, record) {
+    entry.updatedAt = record?.finishedAt || new Date().toISOString();
+    entry.title = entry.session.sessionName || entry.title;
+    const changedFiles = entry.traceChangedFiles || [];
+    entry.traceChangedFiles = [];
+    bus.broadcast(entry, {
+      type: "session.updated", id: entry.id, title: entry.title,
+      messageCount: entry.session.messages.length, updatedAt: entry.updatedAt,
+    });
+    void Promise.resolve(onRunSettled(entry, {
+      changedFiles, aborted, text: record?.text, startedAt: entry.traceRunStartedAt,
+      runId: entry.agui?.activeRunId || entry.localRunId || null,
+    })).catch(() => {});
+  }
+  entry.onTurnDelivered = record => settle(record.status === "cancelled", record);
   entry.unsubscribe = entry.session.subscribe((event) => {
+    const turnId = entry.activeTurn?.turnId;
+    const publish = payload => bus.broadcast(entry, turnId ? { ...payload, turnId } : payload);
     switch (event.type) {
       case "agent_start":
-        entry.localRunId = newRunId();
+        if (turnId && entry.localRunId === turnId) break;
+        entry.localRunId = turnId || newRunId();
         entry.traceChangedFiles = [];
         entry.traceRunStartedAt = new Date().toISOString();
-        bus.broadcast(entry, { type: "run.started" });
+        if (!entry.managedChat) publish({ type: "run.started" });
         break;
       case "message_update":
-        if (event.assistantMessageEvent?.type === "text_delta") {
-          bus.broadcast(entry, { type: "assistant.delta", delta: event.assistantMessageEvent.delta });
+        if (!entry.managedChat && event.assistantMessageEvent?.type === "text_delta") {
+          publish({ type: "assistant.delta", delta: event.assistantMessageEvent.delta });
         }
         break;
       case "tool_execution_start": {
         entry.toolArgs.set(event.toolCallId, event.args || {});
-        bus.broadcast(entry, {
+        publish({
           type: "tool.started",
           id: event.toolCallId,
           name: event.toolName,
@@ -38,7 +56,7 @@ export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, on
         break;
       }
       case "tool_execution_update":
-        bus.broadcast(entry, {
+        publish({
           type: "tool.updated",
           id: event.toolCallId,
           output: resultText(event.partialResult).slice(0, 800),
@@ -105,7 +123,7 @@ export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, on
             /* live message still renders; a refresh will fall back to plain text */
           }
         }
-        bus.broadcast(entry, {
+        publish({
           type: "tool.completed",
           id: event.toolCallId,
           name: event.toolName,
@@ -136,25 +154,10 @@ export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, on
         break;
       }
       case "agent_settled": {
-        entry.updatedAt = new Date().toISOString();
-        const title = entry.session.sessionName || entry.title;
-        entry.title = title;
-        const changedFiles = Array.isArray(entry.traceChangedFiles) ? [...entry.traceChangedFiles] : [];
-        entry.traceChangedFiles = [];
-        bus.broadcast(entry, { type: "run.settled", aborted: event.aborted });
-        bus.broadcast(entry, {
-          type: "session.updated",
-          id: entry.id,
-          title,
-          messageCount: entry.session.messages.length,
-          updatedAt: entry.updatedAt,
-        });
-        void Promise.resolve(onRunSettled(entry, {
-          changedFiles,
-          aborted: event.aborted,
-          startedAt: entry.traceRunStartedAt || null,
-          runId: entry.agui?.activeRunId || entry.localRunId || null,
-        })).catch(() => {});
+        if (!entry.managedChat) {
+          publish({ type: "run.settled", aborted: event.aborted });
+          settle(event.aborted);
+        }
         break;
       }
     }
