@@ -1,0 +1,54 @@
+name: Verify issue 13 candidate
+on:
+  push:
+    branches: ["ci/verify-issue-13-2145500"]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 2145500173b522c360749ee449db2a246739dc0d
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.16.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare fixture and browser dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "2145500173b522c360749ee449db2a246739dc0d"
+          npm ci
+          python -m pip install 'playwright==1.60.0' openpyxl pillow
+          python -m playwright install --with-deps chromium
+          if ! command -v google-chrome >/dev/null; then python -m playwright install chrome; fi
+          echo "PE_BROWSER_PLAYWRIGHT=$(python -c 'import pathlib,playwright; print(pathlib.Path(playwright.__file__).parent/"driver/package/index.mjs")')" >> "$GITHUB_ENV"
+          echo "PYTHON_BIN=$(command -v python)" >> "$GITHUB_ENV"
+      - name: Verify real Workbench recovery in Chrome and over TCP
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$PE_BROWSER_PLAYWRIGHT"
+          npm run build:copilot-pilot
+          npm run test:turn-delivery | tee "$RUNNER_TEMP/turn.log"
+          grep -F "Chrome interleaved framework edits keep each session's verdict through process restart" "$RUNNER_TEMP/turn.log"
+          grep -F "a new server process reloads delivered turn records over TCP" "$RUNNER_TEMP/turn.log"
+      - name: Run protocol, UI and workbook regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run test:protocol
+          npm run test:cell-cite
+          npm run test:presentation
+          npm run test:copilot-pilot
+          npm run test:presentation:browser
+          python scripts/test-streaming-scroll-browser.py
+          npm run test:e2e
+          npm run test:workbook
+          npm run test:server
