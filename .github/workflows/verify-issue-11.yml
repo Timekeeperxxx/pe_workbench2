@@ -45,6 +45,6 @@ jobs:
           npm run build:copilot-pilot
           npm run test:turn-delivery | tee "$RUNNER_TEMP/turn.log"
           grep -F "Chrome interleaved framework edits keep each session's verdict through process restart" "$RUNNER_TEMP/turn.log"
-          npm run test:systemic
+          TZ=Asia/Shanghai npm run test:systemic
           npm run test:p1
           npm run test:fact-memory
