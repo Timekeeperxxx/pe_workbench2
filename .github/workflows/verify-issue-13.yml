@@ -27,6 +27,8 @@ jobs:
           npm ci
           python -m pip install 'playwright==1.60.0' openpyxl pillow
           python -m playwright install --with-deps chromium
+          if ! command -v soffice >/dev/null; then sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-calc; fi
+          soffice --headless --version
           if ! command -v google-chrome >/dev/null; then python -m playwright install chrome; fi
           echo "PE_BROWSER_PLAYWRIGHT=$(python -c 'import pathlib,playwright; print(pathlib.Path(playwright.__file__).parent/"driver/package/index.mjs")')" >> "$GITHUB_ENV"
           echo "PYTHON_BIN=$(command -v python)" >> "$GITHUB_ENV"
