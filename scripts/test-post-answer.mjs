@@ -539,7 +539,14 @@ console.log('target deviation post-answer correction passed');
       + liveSource.materialId + '@v1]Model!B2。';
     const appendedVersion = '第 1 轮已交付回答所引用的出处是工作簿 Acceptance13.xlsx 的单元格 [Acceptance13.xlsx]Model!B2；'
       + '该回答的引用记录中，这份材料的版本为 v1（材料 ID ' + liveSource.materialId + '）。';
-    for (const text of [sourceReport + '。', sourceReport + '（材料版本 v1）。', sourceReport + '（材料第一版）。',
+    // Verbatim structures from the provider's source-only follow-up, using
+    // this fixture's material ID. The second gives a fully qualified spelling.
+    const cellThenNoun = '第1轮回答引用的是 Acceptance13.xlsx 的 Model!B2 单元格（材料 ID ' + liveSource.materialId + '，版本 v1）。';
+    const fullSpelling = '在本会话第1轮历史里，回答所引用的是 [Acceptance13.xlsx]Model!B2；'
+      + '当文件名可能与其他文件重名时，应写作 [' + liveSource.materialId + '@v1]Model!B2，材料版本为 v1。';
+    const listedSource = '第1轮回答的出处如下。\n- 文件名：Acceptance13.xlsx\n- 单元格：Model!B2\n- 材料版本：v1。';
+    const namedFields = '第1轮回答引用的单元格为 Model!B2，工作簿名为 Acceptance13.xlsx，材料版本为 v1。';
+    for (const text of [cellThenNoun, fullSpelling, listedSource, namedFields, sourceReport + '。', sourceReport + '（材料版本 v1）。', sourceReport + '（材料第一版）。',
       sourceReport + '（材料版本 ｖ１）。', sourceOnly, appendedVersion]) {
       const { record } = await runScript([{ search: liveSearch, text }], sourceQuestion);
       assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [liveSource]]);
@@ -547,6 +554,9 @@ console.log('target deviation post-answer correction passed');
     const otherVersion = { ...oldCite, version: 2, filename: 'Other.xlsx' };
     const twoVersions = { matches: [{ ...hit, citations: [liveSource, otherVersion] }] };
     for (const text of [
+      cellThenNoun.replace('版本 v1', '版本 v2'),
+      cellThenNoun.replace('单元格（', '单元格，证明营收增长（'),
+      fullSpelling.replace(liveSource.materialId + '@v1]Model!B2', otherVersion.materialId + '@v2]Model!A1').replace('材料版本为 v1', '材料版本为 v2'),
       sourceReport + '（材料版本 v2）。',
       sourceReport + '（材料第二版）。',
       sourceReport + '（材料版本二）。',

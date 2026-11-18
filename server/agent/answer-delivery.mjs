@@ -60,8 +60,12 @@ function checkSourceFields(clause, refs, lookup, precedingSource) {
   let conflict = '';
   let hasFields = false;
   function check(segment, source) {
-    let text = segment.normalize('NFKC').replace(/[`*]/g, '');
-    if (source?.filename) text = text.replaceAll(source.filename.normalize('NFKC'), ' ');
+    let text = segment.normalize('NFKC').replace(/^\s*[-•]\s+/, '').replace(/[`*]/g, '');
+    if (source?.filename) {
+      const filename = source.filename.normalize('NFKC').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const nameField = String.raw`(?:(?:工作簿|文件)(?:名(?:称)?)?\s*(?:为|是|:)?\s*)?`;
+      text = text.replace(new RegExp(nameField + String.raw`(?<![\w.-])` + filename, 'g'), ' ');
+    }
     const otherWorkbook = text.match(/[^\s()[\]，,。；;]+\.xls[xm]\b/i);
     if (otherWorkbook) conflict = otherWorkbook[0];
     text = text.replace(/(?:材料|文件|material|file)\s*ID\s*(?:为|是|[:=])?\s*([\w-]+)/gi, (field, id) => {
@@ -100,21 +104,26 @@ function checkSourceFields(clause, refs, lookup, precedingSource) {
   return { checked, conflict, hasFields, lastSource };
 }
 
-function reportsHistoricalSource(part, refs, question) {
+const ALTERNATE_SPELLING = /^\s*(?:(?:当|若|如果|为避免)[^，,。；;]{0,48}(?:同名|重名)(?:时)?[,，]\s*)?(?:应当|应该|应|也可|可以|可)?(?:写作|写为|记作|表示为)\s*[:：]?\s*$/;
+function reportsHistoricalSource(part, refs, question, alternateSpelling) {
   let description = part.replace(new RegExp(LOCATOR_SOURCE, 'g'), ' ');
   const historicalSubject = HISTORY.test(description);
   description = description.replace(/第\s*\d+\s*[轮次]|\bturn\s*#?\d+|\d+\s*条(?=\s*(?:命中|记录|结果|[，,。；;]|$))/gi, ' ');
   if (/\d|当前|现在|最新|现价|[零〇一二两三四五六七八九十百千万亿]+(?:元|美元|港元|%)|\b(?:current|now|latest)\b/i.test(description)) return false;
   if (HISTORY.test(question) && REFERENCE.test(question) && SOURCE_ONLY.test(description.trim())) return true;
-  if (!historicalSubject && !(HISTORY.test(question) && /回[答复]|答[文复案]|\b(?:reply|answer)\b/i.test(description))) return false;
+  if (!alternateSpelling && !historicalSubject && !(HISTORY.test(question) && /回[答复]|答[文复案]|\b(?:reply|answer)\b/i.test(description))) return false;
   return refs.every(({ raw, index }) => {
     const prefix = part.slice(0, index).replace(/[`*_]/g, '').trimEnd();
     const suffix = part.slice(index + raw.length).replace(/[`*_]/g, '').trim();
     // Keep the link in the report itself (including a trailing source ID).
     // “The old answer cited B2, proving that …” also makes a new claim.
-    const sourceTail = /^[。，,；;！.!（）()\s]*$/.test(suffix);
+    const sourceTail = /^(?:(?:这[个一]|该)?(?:单元格|坐标)|cell)?[。，,；;！.!（）()\s]*$/i.test(suffix);
     const sourceFirst = /^(?:是|为|was|is).*(?:引用|援引|referenced|cited)(?:的(?:单元格|坐标|出处))?[。.!！]?$/i.test(suffix);
-    return (REPORTED_CELL.test(prefix) && sourceTail) || sourceFirst;
+    // In “引用的是 Book.xlsx 的 B2 单元格” the source noun follows the
+    // locator. The filename was already checked and removed from the prefix.
+    const sourcePrefix = prefix.replace(/(?:工作簿|文件|workbook)?\s*(?:中的?|里的?|内的?|的)\s*$/i, '').trimEnd();
+    return ((REPORTED_CELL.test(prefix) || REPORTED_CELL.test(sourcePrefix) ||
+      (alternateSpelling && ALTERNATE_SPELLING.test(prefix))) && sourceTail) || sourceFirst;
   });
 }
 
@@ -185,7 +194,17 @@ export function reportedLocatorEvidence(text, question, current, matches) {
           if (!sourceNote) precedingSource = undefined;
           continue;
         }
-        const isReport = reportsHistoricalSource(fields.checked, extractLocatorMatches(fields.checked), question);
+        const checkedRefs = extractLocatorMatches(fields.checked);
+        // An adjacent clause may spell out the very same link using its
+        // material ID to disambiguate a filename.
+        const alternateSpelling = precedingSource && checkedRefs.length === 1 &&
+          ALTERNATE_SPELLING.test(fields.checked.slice(0, checkedRefs[0].index));
+        if (alternateSpelling && (!fields.lastSource ||
+            citationIdentity(fields.lastSource) !== citationIdentity(precedingSource) ||
+            locatorKey(fields.lastSource.locator) !== locatorKey(precedingSource.locator))) {
+          return { citations: [], conflict: refs[0].raw };
+        }
+        const isReport = reportsHistoricalSource(fields.checked, checkedRefs, question, alternateSpelling);
         // Resolve historical prose solely against the cited turn. A current
         // reading of the same coordinate can belong to a different version.
         const evidence = isReport ? cells : current;
