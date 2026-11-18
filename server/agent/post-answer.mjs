@@ -5,7 +5,7 @@ import { pendingMerges, readLedger, readLedgerSync } from '../../lib/ledger.mjs'
 import { recordUserClaims } from '../../lib/claim-detect.mjs';
 import { randomUUID } from 'node:crypto';
 import { lintAnswer, lintLedgerAnswer, answerStats, asksDeviationQuestion, contextModelTarget } from '../../lib/answer-lint.mjs';
-import { collectCitationsFromToolCalls, rehydrateCitations } from '../../lib/citations.mjs';
+import { collectCitationsFromToolCalls, currentCitation, rehydrateCitations, toolEvidenceState } from '../../lib/citations.mjs';
 import { markStaleVersions, registerToolResult } from '../../lib/fact-register.mjs';
 import { frameworkForTurn, textOfContent } from './snapshot.mjs';
 import { indexJson, locateChatTopics, recentTopicDialogue } from './topic-locator.mjs';
@@ -130,8 +130,8 @@ async function generateAnswer(entry, promptText, options, active) {
     if (event.type === 'tool_execution_end') {
       const call = toolCalls.findLast(c => c.id === event.toolCallId);
       if (call) {
-        call.success = event.isError === false && event.result?.isError !== true;
         call.details = event.result?.details; call.result=event.result;
+        call.success = event.isError === false && toolEvidenceState(event.result) !== 'failed';
         if(call.success) registrationJobs.push(registerToolResult(entry.ctx?.root,entry.id,call,{turn}).catch(()=>[]));
       }
     }
@@ -164,28 +164,37 @@ async function generateAnswer(entry, promptText, options, active) {
       for (const [index, m] of messages.entries()) for (const c of Array.isArray(m.content) ? m.content : []) {
         if (c.type !== 'toolCall') continue;
         const result = messages.find(r => r.role === 'toolResult' && r.toolCallId === c.id);
-        scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, success: Boolean(result) && result.isError === false, details:result?.details, result });
+        scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, success: Boolean(result) && result.isError === false && toolEvidenceState(result) !== 'failed', details:result?.details, result });
       }
       for(const call of scanned) if(call.success) registrationJobs.push(registerToolResult(entry.ctx?.root,entry.id,call,{turn}).catch(()=>[]));
       const registered= (await Promise.all(registrationJobs)).flat().filter(Boolean);
-      // Preserve distinct material/version identities even when coordinates coincide.
-      const successful = new Map();
-      for (const call of [...scanned, ...toolCalls]) {
-        if (call.success) successful.set(call.id, call);
-      }
-      const thisTurnCitations = collectCitationsFromToolCalls([...successful.values()].reverse());
-      const currentVersions={...(entry.materialVersions||{})};
-      for (const c of thisTurnCitations.toReversed()) if (c.materialId && c.version) currentVersions[c.materialId] = c.version;
-      await markStaleVersions(entry.ctx?.root,entry.id,currentVersions).catch(()=>0);
-      let refreshedLedger=await readLedger(entry.ctx?.root, entry.id);
+      // Deduplicate restored and live copies by execution ID. The live terminal
+      // event is authoritative, including a failure with a valid-looking payload.
+      const calls = [...new Map([...scanned, ...toolCalls].map(call => [call.id, call])).values()];
+      const thisTurnCitations = collectCitationsFromToolCalls(calls);
+      const currentVersions = { ...entry.materialVersions };
+      let refreshedLedger = await readLedger(entry.ctx?.root, entry.id);
       if(entry.ctx?.factMemory) {const project=entry.ctx.factMemory.query({limit:100}); refreshedLedger={...(refreshedLedger || {}),corrections:[],facts:project.facts.map(asLegacyFact)};}
+      const materialIds = new Set([...thisTurnCitations, ...(refreshedLedger?.facts || []).map(f => f.citation)]
+        .map(c => c?.materialId).filter(Boolean));
+      for (const id of materialIds) {
+        const latest = entry.ctx?.store?.getLatestMaterialVersion?.(id)?.v;
+        if (latest != null) currentVersions[id] = latest;
+      }
+      // Minimal sessions may have no material catalogue. Use the newest
+      // observed version in that case, independent of tool completion order.
+      const observedVersions = new Map();
+      for (const {materialId, version} of thisTurnCitations) if (version) {
+        observedVersions.set(materialId, Math.max(version, observedVersions.get(materialId) || 0));
+      }
+      for (const [id, version] of observedVersions) currentVersions[id] ??= version;
+      await markStaleVersions(entry.ctx?.root,entry.id,currentVersions).catch(()=>0);
       if(registered.length) await updateTopicsFromFacts(entry.ctx?.root,entry.id,{factIds:registered.map(f=>f.id),proposer:async({topic,facts})=>indexJson(entry.indexModel,`根据已核事实提出一个用于检索的主题标题、摘要和 binding。摘要不得添加事实数字，只描述指标和期间。严格 JSON 输出 {"title":"...","summary":"...","binding":{...}}。候选主题:${JSON.stringify(topic)}\n已核事实:${JSON.stringify(facts.map(f=>({id:f.id,claim:f.claim,binding:f.binding,period:f.period})))}`,entry.modelPayload)}).catch(()=>[]);
-      const turnCitations = rehydrateCitations({register:refreshedLedger,answer,thisTurnCitations,currentVersions});
+      const turnCitations = rehydrateCitations({register:refreshedLedger,answer,thisTurnCitations,currentVersions,toolCalls:calls});
       entry.citationIndex = turnCitations;
-      const lintContext = { ...baseLintContext, question:text, citations: turnCitations, ...(priorCitations.length ? { priorCitations } : {}) };
-      const calls = [...toolCalls, ...scanned];
+      const lintContext = { ...baseLintContext, question:text, citations: turnCitations, toolCalls: calls, currentVersions, ...(priorCitations.length ? { priorCitations } : {}) };
       const workbookReads = calls.filter(call => call.name === 'workbook_query' || call.name === 'workbook_trace');
-      const workbookEvidence = collectCitationsFromToolCalls(workbookReads.filter(call => call.success));
+      const workbookEvidence = collectCitationsFromToolCalls(workbookReads).filter(c => currentCitation(c, currentVersions));
       const blocks = answerBlocks(answer);
       const workbookTurn = active.attachments?.some(path => /\.xls[xm]$/i.test(path)) || workbookReads.length > 0;
       const coverage = workbookItemCoverage(text, blocks, workbookEvidence, workbookTurn);
@@ -225,7 +234,10 @@ async function generateAnswer(entry, promptText, options, active) {
       // Custom entries are durable metadata, never model-visible chat messages.
       entry.session.sessionManager?.appendCustomEntry('pe_answer_lint', data);
       entry.answerLint = data;
-      const errors = findings.filter(item => item.severity === 'error' && !['incomplete', 'delivery_gap'].includes(item.rule));
+      // A requested item already classified as a delivery gap follows the
+      // established partial-delivery path. Other identity errors get one retry.
+      const errors = findings.filter(item => item.severity === 'error' && !['incomplete', 'delivery_gap'].includes(item.rule) &&
+        !(item.rule === 'evidence_identity_mismatch' && [...coverage.unsupported].some(part => part.includes(item.excerpt))));
       const incomplete = findings.some(item => item.rule === 'incomplete');
       const unverified = findings.filter(item => item.rule === 'unverified_locator' || item.rule === 'orphaned_number');
       const blocking = findings.filter(blockingFinding);
