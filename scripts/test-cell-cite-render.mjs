@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { linkCitations } from "../ui/chat/cell-citations.js";
 import { snapshotMessages } from "../server/agent/snapshot.mjs";
+import { adoptedCitations } from "../server/agent/answer-delivery.mjs";
 
 /* S1: the browser linkifier may only import files the static server exposes
  * under /ui. `/lib` is deliberately not a static root, so a `../../lib/...`
@@ -247,3 +248,35 @@ console.log("cell cite render U1-U6 passed");
   assert.equal(completed.citations.length, 1);
 }
 console.log("cell cite durable bridge U7 passed");
+
+{
+  const old = cite("Model!B2", { id: "old", filename: "A.xlsx", version: 2 });
+  const current = cite("Model!B2", { id: "current", filename: "A.xlsx" });
+  const text = "[A.xlsx@v2]Model!B2 已核实。[A.xlsx]Model!B2（未核验）。";
+  const adopted = adoptedCitations(text, [old, current]);
+  assert.deepEqual(adopted.map(cell => cell.id), ["old"]);
+  const html = linkCitations(text, adopted);
+  assert.equal(buttonCount(html), 1);
+  assert.match(html, /data-version="2"[^>]+>\[A\.xlsx@v2\]Model!B2<\/button>/);
+  assert.equal(unverifiedCount(html), 1);
+}
+
+{
+  const a = cite("Model!B2", { filename: "A.xlsx" });
+  const b = cite("Model!C2", { filename: "B.xlsx", materialId: "mat-2" });
+  for (const text of ["Model!B2:C2", "[A.xlsx]Model!B2:C2"]) {
+    assert.deepEqual(adoptedCitations(text, [a, b]), []);
+    assert.equal(buttonCount(linkCitations(text, [a, b])), 0, "a range must come from one material version");
+  }
+  const text = "[A.xlsx]Model!B2、C2";
+  assert.deepEqual(adoptedCitations(text, [a, b]), [a]);
+  assert.equal(buttonCount(linkCitations(text, [a, b])), 1, "shorthand inherits the anchor material version");
+}
+console.log("cell cite preserves version ambiguity and workbook-scoped ranges and lists");
+
+{
+  const source = cite("R&D!B2", { filename: "R&D.xlsx" });
+  const html = linkCitations("<p>据 [R&amp;D.xlsx]R&amp;D!B2，值为 100。</p>", [source]);
+  assert.equal(buttonCount(html), 1);
+  assert.match(html, /data-locator="R&amp;D!B2"[^>]+>\[R&amp;D\.xlsx\]R&amp;D!B2<\/button>/);
+}

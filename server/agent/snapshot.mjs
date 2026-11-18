@@ -5,6 +5,7 @@
  */
 
 import path from "node:path";
+import {turnTimeline} from "./turn-delivery.mjs";
 import {readLedgerSync, pendingMerges} from "../../lib/ledger.mjs";
 
 export function textOfContent(content) {
@@ -81,9 +82,61 @@ export function makeTitle(text) {
   return first.length > 28 ? `${first.slice(0, 28)}…` : first;
 }
 
+// Pi may compact its model context. History walks the active session branch
+// (including custom lifecycle entries) instead of indexing session.messages.
+function conversationTurns(session) {
+  const timeline = turnTimeline(session);
+  const turns = [];
+  const managed = new Map();
+  let current;
+  for (const item of timeline) {
+    if (item.kind === "start") {
+      if (managed.has(item.turn.turnId)) continue;
+      const turn = { start: item.turn, messages: [] };
+      turns.push(turn);
+      managed.set(item.turn.turnId, turn);
+      if (!item.turn.queued) current = turn;
+    } else if (item.kind === "active") {
+      current = managed.get(item.turnId);
+    } else if (item.kind === "delivery") {
+      const turn = managed.get(item.record.turnId);
+      if (turn && !turn.delivery) turn.delivery = item.record;
+    } else if (item.kind === "lint") {
+      if (current && !current.start) current.lint = item.data;
+    } else if (item.kind === "message") {
+      const { message } = item;
+      if (message.peInternal || message.customType || message.role === "custom") continue;
+      if (message.role === "user") {
+        if (!current?.start || current.user || current.delivery) {
+          current = { messages: [] };
+          turns.push(current);
+        }
+        current.user = message;
+      } else if (message.role === "assistant" || message.role === "toolResult") {
+        if (!current) {
+          current = { messages: [] };
+          turns.push(current);
+        }
+        current.messages.push(message);
+      }
+    }
+  }
+  return turns;
+}
+
+function userMessage(turn) {
+  if (!turn.user && !turn.start) return null;
+  const text = String(turn.start?.question ?? textOfContent(turn.user?.content))
+    .replace(/\n\n\[已上传资料\][\s\S]*$/, "");
+  return {
+    role: "user", text, timestamp: turn.start?.startedAt ?? turn.user?.timestamp,
+    ...(turn.start ? { turnId: turn.start.turnId } : {}),
+  };
+}
+
 export function titleFromMessages(session) {
-  const firstUser = session.messages.find((message) => message.role === "user");
-  return makeTitle(firstUser ? textOfContent(firstUser.content) : "");
+  const first = conversationTurns(session).find(turn => turn.start || turn.user);
+  return makeTitle(first && userMessage(first).text);
 }
 
 export function lastAssistantText(session) {
@@ -97,12 +150,41 @@ export function lastAssistantText(session) {
   return "";
 }
 
-export function snapshotMessages(session, ctx, entry = null) {
-  const results = new Map();
-  for (const message of session.messages) {
-    if (message.peInternal || /^pe_(?:turn_context|answer_)/.test(message.customType || "")) continue;
-    if (message.role === "toolResult") results.set(message.toolCallId, message);
+// Older sessions put text before the last tool in the process view and
+// join subsequent text as the answer, including historical continuations.
+function legacyAnswer(turn) {
+  const process = [];
+  const final = [];
+  for (const message of turn.messages) {
+    if (message.role !== "assistant") continue;
+    const text = textOfContent(message.content).trim();
+    if (text) final.push(text);
+    if (Array.isArray(message.content) && message.content.some(block => block.type === "toolCall")) {
+      process.push(...final.splice(0));
+    }
   }
+  if (!final.length && process.length) {
+    const parts = process.join("\n\n").split("\n\n");
+    return { text: parts.pop(), processText: parts.join("\n\n").trim() };
+  }
+  return { text: final.join("\n\n"), processText: process.join("\n\n") };
+}
+
+function answerMessage(turn) {
+  const { start, delivery } = turn;
+  if (!start) return legacyAnswer(turn);
+  return {
+    turnId: start.turnId,
+    text: delivery?.text ?? "",
+    citations: delivery?.citations ?? [],
+    status: delivery?.status ?? "pending",
+    ...(delivery?.reason ? { reason: delivery.reason } : {}),
+    ...(delivery ? { finishedAt: delivery.finishedAt } : {}),
+  };
+}
+
+export function snapshotMessages(session, ctx, entry = null) {
+  const turns = conversationTurns(session);
   const presentations = new Map();
   const citationsByCall = new Map();
   if (entry) {
@@ -115,67 +197,19 @@ export function snapshotMessages(session, ctx, entry = null) {
       }
     }
   }
-
   const stateContents = new Map(); // reconstructed successful writes/edits, never current disk state
   const out = [];
-  let current = null;
-  let turnStartedAt;
-  const flush = () => {
-    if (!current) return;
-    const segments = current.segments || [];
-    let lastTool = -1;
-    segments.forEach((segment, index) => {
-      if (segment.type === "tool") lastTool = index;
-    });
-
-    const processParts = [];
-    const finalParts = [];
-    segments.forEach((segment, index) => {
-      if (segment.type !== "text") return;
-      if (index > lastTool) finalParts.push(segment.text);
-      else processParts.push(segment.text);
-    });
-
-    let text = finalParts.join("\n\n").trim();
-    let processText = processParts.join("\n\n").trim();
-    if (!text && processText) {
-      // If the model ended on a tool call, keep its last paragraph as the answer.
-      const parts = processText.split("\n\n");
-      text = parts.pop() || "";
-      processText = parts.join("\n\n").trim();
+  for (const turn of turns) {
+    const user = userMessage(turn);
+    if (user) {
+      const {timestamp, ...message} = user;
+      out.push({ ...message, time: hm(timestamp) });
     }
-
-    if (text || processText || current.tools.length) {
-      out.push({
-        role: "assistant",
-        text,
-        processText,
-        tools: current.tools,
-        ...(current.analysisState ? { analysisState: current.analysisState, analysisStatePath: current.analysisStatePath } : {}),
-        time: current.time,
-        turnStartedAt: current.turnStartedAt,
-      });
-    }
-    current = null;
-  };
-
-  for (const message of session.messages) {
-    if (message.peInternal || /^pe_(?:turn_context|answer_)/.test(message.customType || "")) continue;
-    if (message.role === "user") {
-      flush();
-      turnStartedAt = message.timestamp;
-      const userText = textOfContent(message.content).replace(/\n\n\[已上传资料\][\s\S]*$/, "");
-      out.push({ role: "user", text: userText, time: hm(message.timestamp) });
-      continue;
-    }
-    if (message.role !== "assistant") continue;
-
-    if (!current) current = { role: "assistant", segments: [], tools: [], time: hm(message.timestamp), turnStartedAt: turnStartedAt ?? message.timestamp };
-    const text = textOfContent(message.content);
-    if (text) current.segments.push({ type: "text", text });
-
-    for (const block of message.content) {
-      if (block.type !== "toolCall") continue;
+    const current = { tools: [] };
+    const results = new Map(turn.messages.filter(m => m.role === "toolResult").map(m => [m.toolCallId, m]));
+    const calls = turn.messages.flatMap(m => m.role === "assistant" && Array.isArray(m.content)
+      ? m.content.filter(block => block.type === "toolCall") : []);
+    for (const block of calls) {
       const result = results.get(block.id);
       const record = presentations.get(block.id);
       const presentation = record && !record.corrupt && record.payload
@@ -237,21 +271,35 @@ export function snapshotMessages(session, ctx, entry = null) {
           }
         }
       }
-      current.segments.push({ type: "tool" });
-      const citations = citationsByCall.get(block.id) || [];
+      const citations = citationsByCall.get(block.id) ?? result?.details?.citations ?? [];
       current.tools.push({
         id: block.id,
         name: block.name,
         detail: toolDetail(ctx, block.name, block.arguments || {}),
-        status: result ? (result.isError ? "error" : "done") : "done",
+        status: result ? (result.isError ? "error" : "done") : !turn.start ? "done" : turn.delivery ? "error" : "running",
         output: result ? resultText(result).slice(0, 4000) : "",
         ...(citations.length ? { citations } : {}),
         ...(presentation ? { presentation } : {}),
         ...(presentationError ? { presentationError } : {}),
       });
     }
+    const answer = answerMessage(turn);
+    if (turn.start || answer.text || answer.processText || current.tools.length || current.analysisState) {
+      const firstAssistant = turn.messages.find(m => m.role === "assistant");
+      const legacyCitations = new Map();
+      if (!turn.start) {
+        for (const cite of [...(turn.lint?.citations || []), ...current.tools.flatMap(tool => tool.citations || [])]) {
+          if (!legacyCitations.has(cite.id)) legacyCitations.set(cite.id, cite);
+        }
+      }
+      out.push({
+        role: "assistant", ...current, ...answer,
+        ...(legacyCitations.size ? { citations: [...legacyCitations.values()] } : {}),
+        time: hm(turn.delivery?.finishedAt ?? firstAssistant?.timestamp ?? user?.timestamp),
+        turnStartedAt: user?.timestamp ?? firstAssistant?.timestamp,
+      });
+    }
   }
-  flush();
   return out;
 }
 
@@ -263,7 +311,7 @@ export function serializeSession(entry) {
     title: entry.title,
     messages: snapshotMessages(entry.session, entry.ctx, entry),
     streaming: Boolean(entry.session.isStreaming || entry.postAnswerPending),
-    ...(entry.answerLint ? { lint: entry.answerLint } : {}),
+    activeTurnId: entry.activeTurn?.turnId ?? null,
     model: entry.modelId,
     projectId: entry.ctx.id,
     approvals: entry.ctx.store.listApprovalRequests({ threadId: entry.id, limit: 50 }),

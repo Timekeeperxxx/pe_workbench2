@@ -293,9 +293,13 @@ function messageHTML(m) {
   let body = isUser
     ? esc(m.text).split(/\n{2,}/).map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`).join('')
     : (renderFrameworkPresentation(m.analysisState, { highlightBudget, turnStartedAt: m.turnStartedAt, pendingMerge: typeof state !== 'undefined' && (state.pendingMerges || []).some(a => a.path === m.analysisStatePath) }) || renderMarkdownHTML(m.text || '', '', highlightBudget));
-  const citations = (m.tools || []).flatMap(tool => Array.isArray(tool.citations) ? tool.citations : []);
+  const citations = m.citations ?? (m.tools || []).flatMap(tool => Array.isArray(tool.citations) ? tool.citations : []);
   // The vm-based renderer test intentionally omits the module binding.
   if (typeof linkCitations === 'function' && citations.length) body = linkCitations(body, citations);
+  if (!isUser && m.turnId && m.status !== 'completed') {
+    const label = { partial: '部分完成', failed: '回答失败', cancelled: '已取消', pending: '正在处理' }[m.status];
+    if (label) body += `<p class="msg-failure" role="status">${label}${m.reason ? ' · ' + esc(m.reason) : ''}</p>`;
+  }
   const group = isUser ? '' : toolGroupHTML(m.tools || [], { processText: m.processText || '', highlightBudget });
   const reports = isUser ? '' : reportPathsFor(m).map(path => reportCardHTML(path, highlightBudget)).join('');
   return `<article class="msg ${isUser ? 'user' : 'assistant'}">

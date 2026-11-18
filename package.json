@@ -33,6 +33,7 @@
     "test:calc": "node scripts/test-calc-engine.mjs",
     "test:model": "node scripts/test-model-writer.mjs",
     "test:tracking-tool": "node scripts/test-tracking-tool.mjs",
+    "test:turn-delivery": "node scripts/test-post-answer.mjs && node scripts/test-turn-delivery.mjs && node scripts/test-cell-cite-render.mjs",
     "test:protocol": "node scripts/test-protocol.mjs",
     "test:tool-contracts": "node scripts/test-tool-contracts.mjs",
     "test:approvals": "node scripts/test-approvals.mjs",

@@ -13,6 +13,12 @@
 
 `agent_events` 只记录 AG-UI 传输事件；material / tracking / plan / notification 等领域事件不会写入。
 
+### 用户回合的持久化结果
+
+用户回合在校验、纠错或续写结束后，将一条 `pe_turn_delivery` 自定义记录写入当前 Pi 会话分支。记录包含 `version`、`turnId`、`finishedAt`、`text`、实际采用的 `citations` 和 `status`。关联 AG-UI 运行时包含 `runId`。状态为 `partial`、`failed` 或 `cancelled` 时，`reason` 说明缺口或终止原因。`completed` 表示本轮已经交付完整正文。
+
+同一 `turnId` 的首次终态记录生效。会话恢复时，服务端从活动分支读回该记录；已经开始却没有终态记录的回合恢复为失败。会话快照采用已交付的正文和引用，旧会话继续从原始消息重建。运行 `npm run test:turn-delivery` 可验证落盘、重试、恢复及工作簿多指标交付。
+
 ## 2. 标识规范（`lib/agent-protocol/ids.mjs`）
 
 | 标识 | 规则 |

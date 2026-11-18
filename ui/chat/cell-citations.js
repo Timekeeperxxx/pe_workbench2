@@ -11,12 +11,15 @@
 
 import {
   LOCATOR_SOURCE,
+  citationIdentity,
+  citationLookup,
   normalizeLocator,
   resolveLocatorToken,
 } from "./citation-locator.js";
 
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const escapeHTML = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => HTML_ESCAPES[char]);
+const HTML_ENTITIES = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#34;": '"', "&#39;": "'", "&#x27;": "'", "&apos;": "'" };
 const LOCATOR_RE = new RegExp(LOCATOR_SOURCE, "g");
 const BARE_CELL = String.raw`\$?[A-Za-z]{1,3}\$?\d{1,7}`;
 const SEP_THEN_BARE = new RegExp(String.raw`^(\s*[、,，]\s*)(${BARE_CELL})(?![A-Za-z0-9_:])`);
@@ -30,23 +33,11 @@ function sheetOf(locator) {
   return bang > 0 ? locator.slice(0, bang) : null;
 }
 
-function bareButton(sheet, rawCell, lookup) {
+function bareButton(state, rawCell, lookup) {
+  if (!state.source) return null;
   const coord = rawCell.replace(/\$/g, "").toUpperCase();
-  const citation = lookup.get(`${sheet}!${coord}`.toLowerCase());
+  const citation = lookup.get(`${state.sheet}!${coord}`.toLowerCase(), state.source);
   return citation ? citationButton(citation, rawCell) : null;
-}
-
-function citationLookup(citations) {
-  const lookup = new Map();
-  for (const citation of Array.isArray(citations) ? citations : []) {
-    if (!citation || typeof citation !== "object") continue;
-    if (!citation.materialId || !citation.locator) continue;
-    const locator = normalizeLocator(citation.locator);
-    if (!locator) continue;
-    const key = locator.toLowerCase();
-    if (!lookup.has(key)) lookup.set(key, citation);
-  }
-  return lookup;
 }
 
 function citationTitle(citation) {
@@ -77,13 +68,24 @@ function unverifiedSpan(label) {
   return `<span class="cell-ref-unverified" title="未核验：本轮工具未返回这个单元格">${escapeHTML(label)}</span>`;
 }
 
-function linkText(text, lookup, state) {
-  if (!text) return "";
+function linkText(html, lookup, state) {
+  if (!html) return "";
+  // Match sheet names and workbook qualifiers in visible text. Copy untouched
+  // spans from the original HTML and escape any text inserted into a button.
+  const offsets = [];
+  let shift = 0;
+  const text = html.replace(/&(?:amp|lt|gt|quot|apos|#34|#39|#x27);/g, (entity, index) => {
+    shift += entity.length - 1;
+    offsets.push({ at: index + entity.length - shift, shift });
+    return HTML_ENTITIES[entity];
+  });
+  const rawIndex = index => index + (offsets.findLast(offset => offset.at <= index)?.shift || 0);
+  const rawSlice = (start, end = text.length) => html.slice(rawIndex(start), rawIndex(end));
   let output = "";
   let index = 0;
 
   const finishTail = (tail) => {
-    output += tail;
+    output += rawSlice(index);
     if (!tail) return;
     if (ONLY_GAP.test(tail)) {
       if (HAS_SEPARATOR.test(tail)) state.sep = true;
@@ -96,7 +98,7 @@ function linkText(text, lookup, state) {
   if (state.sep && state.sheet) {
     const leading = text.match(LEADING_BARE);
     if (leading) {
-      const button = bareButton(state.sheet, leading[2], lookup);
+      const button = bareButton(state, leading[2], lookup);
       output += leading[1] + (button || leading[2]);
       index = leading[0].length;
       state.sep = false;
@@ -118,7 +120,7 @@ function linkText(text, lookup, state) {
     if (state.sheet && !state.sep) {
       const run = text.slice(index).match(SEP_THEN_BARE);
       if (run) {
-        const button = bareButton(state.sheet, run[2], lookup);
+        const button = bareButton(state, run[2], lookup);
         output += run[1] + (button || run[2]);
         index += run[0].length;
         continue;
@@ -141,7 +143,7 @@ function linkText(text, lookup, state) {
     const start = match.index ?? 0;
     const between = text.slice(index, start);
     if (between) {
-      output += between;
+      output += rawSlice(index, start);
       if (!(state.sheet && ONLY_GAP.test(between))) {
         state.sheet = null;
         state.sep = false;
@@ -151,7 +153,7 @@ function linkText(text, lookup, state) {
     }
     const resolved = resolveLocatorToken(match[0], lookup);
     if (!resolved) {
-      output += match[0];
+      output += rawSlice(start, start + match[0].length);
       index = start + match[0].length;
       state.sheet = null;
       state.sep = false;
@@ -161,11 +163,12 @@ function linkText(text, lookup, state) {
     // The resolver may trim a prose prefix; keep it outside the chip.
     const offset = raw.lastIndexOf(resolved.raw);
     const prefix = offset > 0 ? raw.slice(0, offset) : "";
-    output += prefix;
+    output += rawSlice(start, start + prefix.length);
     output += resolved.citation
       ? citationButton(resolved.citation, resolved.raw)
       : unverifiedSpan(resolved.raw);
     state.sheet = sheetOf(resolved.locator);
+    state.source = resolved.citation ? citationIdentity(resolved.citation) : null;
     state.sep = false;
     index = start + prefix.length + resolved.raw.length;
   }
@@ -204,7 +207,7 @@ export function linkCitations(textHtml, citations) {
     } else if (/^<\s*\/\s*(?:a|button)\s*>/i.test(token)) {
       skipDepth = Math.max(0, skipDepth - 1);
       reset();
-    } else if (!INLINE_TAG.test(token)) {
+    } else if (!INLINE_TAG.test(token) && !(state.sep && /^<br\s*\/?\s*>$/i.test(token))) {
       reset();
     }
     cursor = start + token.length;
