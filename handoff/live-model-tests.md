@@ -1,0 +1,6 @@
+# Live model tests
+
+- If a provider returns an insufficient-balance error during a live test of provider-independent behavior, rerun the same scenario with OpenRouter's free models. Keep the test assertions and record both the original error and the fallback result. A test of a provider-specific API still needs that provider.
+- For Workbench chat and topic indexing, run `npm start` with `OPENROUTER_API_KEY` and `PI_OPENROUTER_MODELS` in the environment or the Git-ignored `.env.local`. Keep the key out of source control and test output.
+- Use this tested order for `PI_OPENROUTER_MODELS`: `baidu/ernie-5.5-flash-preview:free,nvidia/nemotron-3.5-lightning:free,cohere/north-mini-code:free`. The first model is the default and OpenRouter tries the remaining models in order on eligible errors.
+- For a standalone Node smoke test, load `.env.local` with `node --env-file=.env.local` and call `POST https://openrouter.ai/api/v1/chat/completions` with the bearer key from `process.env.OPENROUTER_API_KEY`. Send the ordered IDs in `models` with the test messages. If the configured models are no longer available, check the [OpenRouter free-model catalog](https://openrouter.ai/collections/free-models) and verify a free replacement with a live call. Include a tool call if the test depends on tools.
