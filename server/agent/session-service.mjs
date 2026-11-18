@@ -30,6 +30,7 @@ import {
   transcriptMessages,
   titleFromMessages,
 } from "./snapshot.mjs";
+import { assessContextBudget, contextBudgetFailureStream, fitContextMessages } from "../../lib/context-budget.mjs";
 import { systemHint } from "../project-context.mjs";
 
 export function createSessionService({
@@ -176,16 +177,20 @@ export function createSessionService({
           .concat(sessionTools, createFrameworkEditTool(ctx.root, () => entry?.activeTurn)),
       });
       session = created.session;
-      if (config.modelPayload) {
-        const stream = session.agent.streamFunction;
-        session.agent.streamFunction = (model, context, options) => stream(model, context, {
+      const stream = session.agent.streamFunction;
+      session.agent.streamFunction = (model, context, options) => {
+        const messages = fitContextMessages(context.messages, model, undefined, options?.maxTokens);
+        if (!assessContextBudget(messages, model, options?.maxTokens).ok) return contextBudgetFailureStream(model);
+        const request = messages === context.messages ? context : { ...context, messages };
+        if (!config.modelPayload) return stream(model, request, options);
+        return stream(model, request, {
           ...options,
           onPayload: async (payload, requestModel) => {
             const transformed = await options?.onPayload?.(payload, requestModel);
             return config.modelPayload(transformed ?? payload, requestModel);
           },
         });
-      }
+      };
     }
 
     session.agent.beforeToolCall = async ({ toolCall, args }) => {

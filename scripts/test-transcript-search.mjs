@@ -82,3 +82,36 @@ console.log('transcript search PASS');
   assert.ok(result.content[0].text.length <= 12000);
   assert.deepEqual(result.details.matches[0].citations, citations);
 }
+
+{
+  const history = [
+    { role: 'user', content: 'FY2024 收入' },
+    { role: 'assistant', content: 'FY2024 收入为 827.35 万元。' },
+  ];
+  for (const size of [3, 2100]) {
+    const ledger = {
+      sessionId: 'stable-fixture', claims: [], corrections: [],
+      facts: Array.from({ length: size }, (_, i) => ({ id: 'fact-' + i,
+        claim: '收入', period: 'FY2024', value: i + 1, unit: '万元', turn: 1 })),
+    };
+    const tool = createTranscriptSearchTool({ getMessages: () => history, getLedger: () => ledger });
+    const result = await tool.execute('miss', {query:'缺失指标'});
+    const projected = JSON.parse(result.content[0].text);
+    assert.equal(projected.ledger, undefined);
+    assert.deepEqual(projected.matches, []);
+    assert.deepEqual(projected.ledgerMatches, []);
+    assert.equal(projected.coverage.turnsScanned, 1);
+    assert.equal(projected.ledgerCoverage.factsScanned, size);
+    assert.equal(projected.ledgerSummary.facts, size);
+    assert.equal(projected.ledgerTotalMatches, 0);
+    assert.ok(result.content[0].text.length < 12000);
+    assert.equal(result.details.ledger, ledger);
+    const hit = await tool.execute('hit', {query:'收入', limit:50});
+    assert.ok(hit.content[0].text.length <= 12000);
+    const context = JSON.parse(hit.content[0].text);
+    assert.match(context.matches[1].excerpt, /827\.35/);
+    assert.ok(context.ledgerMatches.length);
+    assert.equal(context.ledgerTotalMatches, size);
+  }
+  console.log('transcript and ledger hit/miss coverage with growing fixtures PASS');
+}
