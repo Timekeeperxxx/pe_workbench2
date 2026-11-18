@@ -196,12 +196,18 @@ async function generateAnswer(entry, promptText, options, active) {
       const workbookTurn = active.attachments?.some(path => /\.xls[xm]$/i.test(path)) || workbookReads.length > 0;
       const coverage = workbookItemCoverage(text, blocks, workbookEvidence, workbookTurn);
       const locatorEvidence = candidate => reportedLocatorEvidence(candidate, text, turnCitations, historical);
-      const available = locatorEvidence(answer);
+      const sourceReport = locatorEvidence(answer);
+      const available = sourceReport.citations;
       const findingsFor = (candidate, checkContext = lintContext) => {
         const lastLine = candidate.slice(candidate.lastIndexOf('\n') + 1);
         const endsWithVerifiedValue = coverage.verifiedEndings.has(lastLine);
-        const lint = lintAnswer(candidate, { ...checkContext, locatorCitations: candidate === answer ? available : locatorEvidence(candidate) }).filter(finding =>
+        const report = candidate === answer ? sourceReport : locatorEvidence(candidate);
+        const lint = lintAnswer(candidate, { ...checkContext, locatorCitations: report.citations }).filter(finding =>
           finding.rule !== 'incomplete' || finding.message !== '句末可能截断' || !endsWithVerifiedValue);
+        if (report.conflict) lint.push({
+          rule: 'unverified_locator', severity: 'error', message: '答文注明的材料或版本与历史引用不一致',
+          excerpt: report.conflict, expected: '使用命中的正式答文所引用的材料 ID、版本和单元格',
+        });
         return [
           ...lintFactIdentity(candidate, entry.ctx?.factMemory, { question: text }),
           ...lint,
@@ -245,9 +251,9 @@ async function generateAnswer(entry, promptText, options, active) {
         (call.name !== 'workbook_query' || candidateCalls.lastIndexOf(call) >= lastVerifiedRead));
       const toolGap = failedTool ? `工具 ${failedTool.name} 执行失败。` : '';
       if (blocking.length || !answer || toolGap) {
-        safeText = verifiedPortion(blocks, locatorEvidence,
+        safeText = verifiedPortion(blocks, part => locatorEvidence(part).citations,
           part => findingsFor(part, { ...lintContext, requiredSections: [] }), coverage);
-        safeCitations = adoptedCitations(safeText, locatorEvidence(safeText));
+        safeCitations = adoptedCitations(safeText, locatorEvidence(safeText).citations);
       } else {
         return { status: 'completed', text: answer, citations: adopted };
       }

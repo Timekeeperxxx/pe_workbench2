@@ -533,6 +533,61 @@ console.log('target deviation post-answer correction passed');
       assert.deepEqual(record.citations, [liveSource]);
     }
 
+    const sourceReport = '已交付回答引用的单元格是 [Acceptance13.xlsx]Model!B2';
+    const sourceOnly = '第 1 轮已交付回答引用的出处为：工作簿 Acceptance13.xlsx（材料 ID 为 '
+      + liveSource.materialId + '，材料版本 v1），对应单元格 Model!B2；该回答中的引用写作 ['
+      + liveSource.materialId + '@v1]Model!B2。';
+    const appendedVersion = '第 1 轮已交付回答所引用的出处是工作簿 Acceptance13.xlsx 的单元格 [Acceptance13.xlsx]Model!B2；'
+      + '该回答的引用记录中，这份材料的版本为 v1（材料 ID ' + liveSource.materialId + '）。';
+    for (const text of [sourceReport + '。', sourceReport + '（材料版本 v1）。', sourceReport + '（材料第一版）。',
+      sourceReport + '（材料版本 ｖ１）。', sourceOnly, appendedVersion]) {
+      const { record } = await runScript([{ search: liveSearch, text }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [liveSource]]);
+    }
+    const otherVersion = { ...oldCite, version: 2, filename: 'Other.xlsx' };
+    const twoVersions = { matches: [{ ...hit, citations: [liveSource, otherVersion] }] };
+    for (const text of [
+      sourceReport + '（材料版本 v2）。',
+      sourceReport + '（材料第二版）。',
+      sourceReport + '（材料版本二）。',
+      sourceReport + '（材料版本 v２）。',
+      sourceReport + '（材料版本 v1.2）。',
+      sourceReport + '（材料版本 v1，这说明收入增长）。',
+      sourceReport + '（材料版本 v1）；对应营业收入 2025A、常量值 317、单位百万元。',
+      sourceReport.replace('单元格是', '是 Other.xlsx 的单元格') + '。',
+      sourceReport + '（材料 ID ' + otherVersion.materialId + '，版本 v1）。',
+      sourceOnly.replace('材料版本 v1', '材料版本 v2'),
+      appendedVersion.replace('版本为 v1', '版本为 v2'),
+      sourceReport + '（材料版本 v1），值为 317 百万元、期间 2025A、营业收入。',
+    ]) {
+      const { record } = await runScript([{ search: twoVersions, text }, { text }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['failed', '', []], text);
+    }
+    // A live read of v2 cannot replace (or override) the historical link to v1.
+    const directV2 = { ...liveSource, id: 'direct-v2', version: 2, value: 942 };
+    for (const [report, expectedStatus] of [
+      [sourceReport + '（材料版本 v1）。', 'completed'],
+      [sourceReport.replace('.xlsx]', '.xlsx@v2]') + '。', 'failed'],
+    ]) {
+      const { record } = await runScript([
+        { citations: [directV2], text: '出处是 Missing!A9。' }, { search: liveSearch, text: report },
+      ], sourceQuestion);
+      assert.equal(record.status, expectedStatus);
+      assert.deepEqual(record.citations, expectedStatus === 'completed' ? [liveSource] : []);
+    }
+    for (const wrongNote of [sourceReport + '。该材料版本为 v2。', '该材料版本为二。' + sourceReport + '。']) {
+      const { record } = await runScript([{ search: liveSearch, text: wrongNote }, { text: wrongNote }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['partial', sourceReport + '。', [liveSource]]);
+    }
+    const financialNote = sourceReport + '（材料版本 v1）。对应营业收入 2025A、常量值 317、单位百万元。';
+    const mixedNote = await runScript([{ search: liveSearch, text: financialNote }, { text: financialNote }], sourceQuestion);
+    assert.deepEqual([mixedNote.record.status, mixedNote.record.text, mixedNote.record.citations],
+      ['partial', sourceReport + '（材料版本 v1）。', [liveSource]]);
+    const withGap = appendedVersion + '\n\n未核验：说话时该文件在项目中的实际存放路径及磁盘上的版本副本。';
+    const withGapResult = await runScript([{ search: liveSearch, text: withGap }], sourceQuestion);
+    assert.deepEqual([withGapResult.record.status, withGapResult.record.text, withGapResult.record.citations],
+      ['partial', appendedVersion, [liveSource]]);
+
     // Same coordinate, value and material as the positive case. Only the
     // original delivered assistant match can support reporting its source.
     for (const [details, text] of [

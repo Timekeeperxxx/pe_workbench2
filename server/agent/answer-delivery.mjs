@@ -48,75 +48,170 @@ const SOURCE_ONLY = /^[\s`*_]*(?:(?:它|其|所)?(?:引用|援引)(?:的)?(?:单
 
 // Every locator must be the object of the source report. In “the old
 // answer cited A1, which proves revenue grew” a citation cannot verify growth.
-const REPORTED_CELL = /(?:引用|援引|出处|出自|指向|依据|来源|坐标|单元格|cit(?:ed|ation)|refer(?:red to|enced)|source|cell)\s*(?:的|是|为|在|了|就是|is|was|:|：|\s)*$/i;
+const REPORTED_CELL = /(?:引用|援引|出处|出自|指向|依据|来源|坐标|单元格|cit(?:ed|ation)|refer(?:red to|enced)|source|cell)\s*(?:的|是|为|在|了|就是|写作|写为|is|was|:|：|\s)*$/i;
 
-function reportsHistoricalSource(part, refs, question, cells) {
-  let description = part.replace(new RegExp(LOCATOR_SOURCE, 'g'), ' ');
-  // Counts, turn labels and original source metadata can contain digits.
-  for (const cell of cells) {
-    for (const name of [cell.filename, cell.materialId + '@v' + cell.version]) {
-      if (name) description = description.replaceAll(name, ' ');
-    }
+const VERSION_LABEL = String.raw`(?:[\da-z_-]+(?:\.[\da-z_-]+)*|[零〇一二两三四五六七八九十百千]+)`;
+const SOURCE_VERSION = new RegExp(String.raw`(?:(?:材料|文件)(?:的)?\s*)?(?:版本(?:号)?|\bversion)\s*(?:为|是|[:=])?\s*v?\s*(${VERSION_LABEL})|(?:材料|文件)?第\s*(${VERSION_LABEL})\s*版|(?<!\w)@?v(\d+(?:\.\d+)*)\b`, 'gi');
+
+// Check descriptive fields against the source of the written locator. Keep the
+// original answer and its qualifiers intact for lint, delivery and linking.
+function checkSourceFields(clause, refs, lookup, precedingSource) {
+  const resolved = refs.map(ref => resolveLocatorToken(ref.raw, lookup)?.citation);
+  let conflict = '';
+  let hasFields = false;
+  function check(segment, source) {
+    let text = segment.normalize('NFKC').replace(/[`*]/g, '');
+    if (source?.filename) text = text.replaceAll(source.filename.normalize('NFKC'), ' ');
+    const otherWorkbook = text.match(/[^\s()[\]，,。；;]+\.xls[xm]\b/i);
+    if (otherWorkbook) conflict = otherWorkbook[0];
+    text = text.replace(/(?:材料|文件|material|file)\s*ID\s*(?:为|是|[:=])?\s*([\w-]+)/gi, (field, id) => {
+      hasFields = true;
+      if (source?.materialId !== id) conflict = field;
+      return ' ';
+    });
+    text = text.replace(SOURCE_VERSION, (field, labeled, numbered, short) => {
+      hasFields = true;
+      if (source?.version !== ordinal(labeled || numbered || short)) conflict = field;
+      return ' ';
+    });
+    return text.replace(/\([\s,、]*\)/g, ' ');
   }
+  let checked = '';
+  let end = 0;
+  for (const [i, ref] of refs.entries()) {
+    const previous = resolved[i - 1];
+    const source = resolved[i];
+    let gap = clause.slice(end, ref.index);
+    // A parenthetical immediately following the previous cell belongs to it.
+    // Unattached fields between different sources have no unique owner.
+    if (i && previous && source && citationIdentity(previous) !== citationIdentity(source)) {
+      const note = gap.match(/^\s*[（(][^()（）]*[)）]/)?.[0] || '';
+      checked += check(note, previous);
+      gap = gap.slice(note.length);
+      checked += check(gap, null);
+    } else {
+      checked += check(gap, source);
+    }
+    checked += ref.raw;
+    end = ref.index + ref.raw.length;
+  }
+  const lastSource = refs.length ? resolved.at(-1) : precedingSource;
+  checked += check(clause.slice(end), lastSource);
+  return { checked, conflict, hasFields, lastSource };
+}
+
+function reportsHistoricalSource(part, refs, question) {
+  let description = part.replace(new RegExp(LOCATOR_SOURCE, 'g'), ' ');
   const historicalSubject = HISTORY.test(description);
   description = description.replace(/第\s*\d+\s*[轮次]|\bturn\s*#?\d+|\d+\s*条(?=\s*(?:命中|记录|结果|[，,。；;]|$))/gi, ' ');
   if (/\d|当前|现在|最新|现价|[零〇一二两三四五六七八九十百千万亿]+(?:元|美元|港元|%)|\b(?:current|now|latest)\b/i.test(description)) return false;
   if (HISTORY.test(question) && REFERENCE.test(question) && SOURCE_ONLY.test(description.trim())) return true;
   if (!historicalSubject && !(HISTORY.test(question) && /回[答复]|答[文复案]|\b(?:reply|answer)\b/i.test(description))) return false;
   return refs.every(({ raw, index }) => {
-    let prefix = part.slice(0, index).replace(/[`*_]/g, '').trimEnd();
-    for (const { filename } of cells) if (filename) prefix = prefix.replaceAll(filename, '').trimEnd();
+    const prefix = part.slice(0, index).replace(/[`*_]/g, '').trimEnd();
     const suffix = part.slice(index + raw.length).replace(/[`*_]/g, '').trim();
     // Keep the link in the report itself (including a trailing source ID).
     // “The old answer cited B2, proving that …” also makes a new claim.
-    const sourceTail = /^[。，,；;！.!）)\s]*$/.test(suffix) || /^[（(，,]\s*(?:材料|文件|版本|来源|material|file|version)/i.test(suffix);
+    const sourceTail = /^[。，,；;！.!（）()\s]*$/.test(suffix);
     const sourceFirst = /^(?:是|为|was|is).*(?:引用|援引|referenced|cited)(?:的(?:单元格|坐标|出处))?[。.!！]?$/i.test(suffix);
     return (REPORTED_CELL.test(prefix) && sourceTail) || sourceFirst;
   });
 }
 
+function ordinal(label) {
+  if (/^\d+$/.test(label)) return Number(label);
+  if (!/^[零〇一二两三四五六七八九十百千]+$/.test(label)) return NaN;
+  let number = 0;
+  let digit = 0;
+  for (const ch of label) {
+    const unit = { 十: 10, 百: 100, 千: 1000 }[ch];
+    if (unit) {
+      number += (digit || 1) * unit;
+      digit = 0;
+    } else {
+      digit = '零一二三四五六七八九'.indexOf(ch.replace('两', '二').replace('〇', '零'));
+    }
+  }
+  return number + digit;
+}
+
 function explicitTurns(text) {
-  const digits = '零一二三四五六七八九';
   const turns = new Set();
   for (const match of text.matchAll(/第\s*([零一二三四五六七八九十百千\d]+)\s*[轮次]|\bturn\s*#?(\d+)/gi)) {
-    const label = match[1] || match[2];
-    if (/^\d+$/.test(label)) { turns.add(Number(label)); continue; }
-    let number = 0;
-    let digit = 0;
-    for (const ch of label) {
-      const unit = { 十: 10, 百: 100, 千: 1000 }[ch];
-      if (unit) {
-        number += (digit || 1) * unit;
-        digit = 0;
-      } else {
-        digit = digits.indexOf(ch);
-      }
-    }
-    turns.add(number + digit);
+    turns.add(ordinal(match[1] || match[2]));
   }
   if (/首轮/.test(text)) turns.add(1);
   return turns;
 }
 
 export function reportedLocatorEvidence(text, question, current, matches) {
-  if (!matches.length) return current;
+  const fallback = { citations: current };
+  if (!matches.length && !(HISTORY.test(question) && REFERENCE.test(question))) return fallback;
   const requested = explicitTurns(question);
   const allowed = matches.filter(match => !requested.size || requested.has(match.turn));
-  const used = new Set(current);
+  const used = new Map();
+  const bindings = [];
+  let hasHistoricalLink = false;
+  let precedingSource;
   for (const { parts } of answerBlocks(text)) {
-    for (const part of parts) {
-      const refs = extractLocatorMatches(part);
-      if (!refs.length) continue;
+    for (const [partIndex, part] of parts.entries()) {
       const reported = explicitTurns(part);
       const cells = allowed.filter(match => !reported.size || reported.has(match.turn)).flatMap(match => match.citations);
-      const evidence = cells.length && reportsHistoricalSource(part, refs, question, cells) ? [...current, ...cells] : current;
-      const lookup = citationLookup(evidence);
-      // Do not let a link admitted by another sentence cover this one.
-      if (refs.some(ref => !resolveLocatorToken(ref.raw, lookup)?.citation)) return current;
-      for (const cell of adoptedCitations(part, evidence)) used.add(cell);
+      const historyLookup = citationLookup(cells);
+      for (const [i, clause] of part.split(/[；;]/).entries()) {
+        const refs = extractLocatorMatches(clause);
+        let noteSource = precedingSource;
+        if (!refs.length && !noteSource) {
+          // A standalone version or ID may also introduce the next source.
+          const nextRef = extractLocatorMatches(parts[partIndex + 1])[0];
+          if (!nextRef || !REFERENCE.test(question)) continue;
+          noteSource = resolveLocatorToken(nextRef.raw, historyLookup)?.citation;
+        }
+        const fields = checkSourceFields(clause, refs, historyLookup, noteSource);
+        if (!refs.length) {
+          // Only an adjacent source note can qualify the preceding citation.
+          const sourceNote = /材料|文件|工作簿|版本|引用记录|material|file|version/i.test(clause) && !/当前|现在|最新/.test(clause);
+          if (fields.conflict && sourceNote) return { citations: [], conflict: fields.conflict };
+          const noteOnly = /^(?:[\s。，,.()（）:：]|该|这|那|份|其|的|为|是|中|对应|引用|记录|回答|工作簿|材料|文件)*$/.test(fields.checked);
+          // A financial gloss can follow a source report after a full stop.
+          // The historical hit cannot stand in for a direct read of that cell.
+          const cellClaim = /^(?:对应|其|该|这|上述|前述)/.test(clause.trim()) &&
+            /数值|常量值|期间|单位|收入|营收|利润|金额|增长|下降/.test(fields.checked);
+          if (cellClaim && precedingSource && !current.some(cell => citationIdentity(cell) === citationIdentity(precedingSource) &&
+            locatorKey(cell.locator) === locatorKey(precedingSource.locator))) return { citations: [], conflict: clause };
+          if ((i || (sourceNote && fields.hasFields)) && !noteOnly) {
+            return { citations: [], conflict: clause };
+          }
+          if (!sourceNote) precedingSource = undefined;
+          continue;
+        }
+        const isReport = reportsHistoricalSource(fields.checked, extractLocatorMatches(fields.checked), question);
+        // Resolve historical prose solely against the cited turn. A current
+        // reading of the same coordinate can belong to a different version.
+        const evidence = isReport ? cells : current;
+        const lookup = isReport ? historyLookup : citationLookup(current);
+        if (isReport && fields.conflict) return { citations: [], conflict: fields.conflict };
+        for (const { raw } of refs) {
+          const source = resolveLocatorToken(raw, lookup)?.citation;
+          if (!source) return isReport ? { citations: [], conflict: raw } : { citations: [] };
+          bindings.push({ raw, identity: citationIdentity(source) });
+        }
+        for (const cell of adoptedCitations(clause, evidence)) used.set(cell.id, cell);
+        precedingSource = isReport ? fields.lastSource : undefined;
+        hasHistoricalLink ||= isReport;
+      }
     }
   }
-  return [...used];
+  if (!hasHistoricalLink) return fallback;
+  const citations = [...used.values()];
+  const delivered = citationLookup(citations);
+  // The browser has one citation list for the entire answer. Each written
+  // locator must still select its own source after the lists are combined.
+  for (const { raw, identity } of bindings) {
+    const source = resolveLocatorToken(raw, delivered)?.citation;
+    if (!source || citationIdentity(source) !== identity) return { citations: [], conflict: raw };
+  }
+  return { citations };
 }
 
 export function joinContinuation(prefix, delta) {

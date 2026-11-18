@@ -403,13 +403,8 @@ book.save(data)
 sys.stdout.buffer.write(data.getvalue())
 `, String(value)]);
   const initial = workbook(317);
-  const updated = workbook(911);
-  async function upload() {
-    const uploaded = await fetch(base + "/api/upload", { method: "POST", body: initial,
-      headers: { "x-file-name": filename, "content-type": "application/octet-stream" } });
-    assert.equal(uploaded.status, 201);
-    return uploaded.json();
-  }
+  const updated = workbook(942);
+  const coldCases = [];
   const original = `最终稿B（字段名 isError）依据 [${filename}]Model!B2。`;
   const historical = `历史检索命中。那条正式回答引用的是 [${filename}]Model!B2。`;
   const internal = "用户还没有看到这份草稿";
@@ -430,6 +425,27 @@ sys.stdout.buffer.write(data.getvalue())
       id: "legacy-cell", materialId: book.material.id, version: 1, filename, locator: "Model!B2", value: 317,
     }] });
     return manager.getSessionId();
+  }
+
+  async function openOriginalCell(page, body, materialId) {
+    await body.locator("[data-cell-cite]").click();
+    const cell = page.locator('#xlsxSheet .xlsx-c.is-sel[data-r="2"][data-c="2"]');
+    await cell.waitFor();
+    assert.equal(await cell.innerText(), "317");
+    assert.equal(await page.locator('#xlsxTabs [aria-selected="true"]').innerText(), "Model");
+    assert.deepEqual(await page.evaluate(() => [state.openFileId, state.selectedVersion]), [materialId, 1]);
+    await page.locator("#dClose").click();
+  }
+
+  async function checkReply(ui, record, index) {
+    await ui.page.waitForFunction(id => state.messages.some(m =>
+      m.role === "assistant" && m.turnId === id && m.status !== "pending"), record.turnId);
+    const copies = await ui.page.evaluate(id => state.messages.filter(m => m.role === "assistant" && m.turnId === id), record.turnId);
+    assert.deepEqual(copies.map(publicAnswer), [publicAnswer(record)]);
+    const body = answers(ui.page).nth(index).locator(".msg-body");
+    if (record.status === "completed") assert.equal(await body.innerText(), record.text);
+    else assert.equal(await body.locator("[data-cell-cite]").count(), 0);
+    return body;
   }
 
   // Check the content within each call. Its arguments, the answer body and a
@@ -457,21 +473,31 @@ sys.stdout.buffer.write(data.getvalue())
   for (const transport of ["legacy", "agui"]) {
     for (const history of ["managed", "old Pi"]) {
       await t.test(`Chrome ${transport} ${history}: search delivered history`, async t => {
-        const book = await upload();
-        const oldId = history === "old Pi" && createOldHistory(book);
+        let book, id;
         const ui = await open(t, transport);
-        let id;
-        if (oldId) {
-          id = oldId;
-          await ui.select(id);
+        if (history === "old Pi") {
+          const res = await fetch(base + "/api/upload", { method: "POST", body: initial,
+            headers: { "x-file-name": filename, "content-type": "application/octet-stream" } });
+          assert.equal(res.status, 201);
+          book = await res.json();
+          id = createOldHistory(book);
+          await ui.reload(id);
         } else {
           ({ id } = await ui.newSession());
           const entry = app.live.get(id);
-          scriptModel(entry, [
-            { tool: { path: book.path, query: "Model!B2", sheet: "Model" }, stopReason: "toolUse" },
-            { text: draft }, { text: original },
+          const tool = { query: "Model!B2", sheet: "Model" };
+          const model = scriptModel(entry, [
+            { tool, pause: true, stopReason: "toolUse" }, { text: draft }, { text: original },
           ]);
+          t.after(model.resume);
+          await ui.page.locator("#fileInput").setInputFiles({ name: filename, mimeType: "application/octet-stream", buffer: initial });
+          const uploaded = ui.page.waitForResponse(r => new URL(r.url()).pathname === "/api/upload" && r.request().method() === "POST");
           await ui.send("请核对单元格。");
+          const res = await uploaded;
+          assert.equal(res.status(), 201);
+          book = await res.json();
+          tool.path = book.path;
+          model.resume();
           await answers(ui.page).first().locator(".msg-body").getByText(original, { exact: true }).waitFor();
           assert.ok(entry.session.sessionManager.getBranch().some(row =>
             row.customType === "pe_answer_correct" && JSON.stringify(row.content).includes(internal)));
@@ -488,7 +514,7 @@ sys.stdout.buffer.write(data.getvalue())
         assert.equal(changed.id, book.material.id);
         assert.equal(changed.versions[0].v, 2);
         const grid = await json(`/api/materials/${book.material.id}/versions/2/workbook/sheets/Model`);
-        assert.equal(grid.cells.find(([r, c]) => r === 2 && c === 2)[2], 911);
+        assert.equal(grid.cells.find(([r, c]) => r === 2 && c === 2)[2], 942);
         await ui.reload(id);
         await ui.page.waitForFunction(id => state.files.some(f =>
           f.id === id && f.versions.some(version => version.v === 2)), book.material.id);
@@ -538,13 +564,7 @@ sys.stdout.buffer.write(data.getvalue())
           await rows.nth(1).locator(".msg-body").getByText(historical, { exact: true }).waitFor();
           await ui.ready();
           assert.deepEqual(await rows.locator(".msg-body").allInnerTexts(), [original, historical]);
-          await rows.nth(1).locator(".msg-body [data-cell-cite]").click();
-          const cell = ui.page.locator('#xlsxSheet .xlsx-c.is-sel[data-r="2"][data-c="2"]');
-          await cell.waitFor();
-          assert.equal(await cell.innerText(), "317");
-          assert.equal(await ui.page.locator('#xlsxTabs [aria-selected="true"]').innerText(), "Model");
-          assert.deepEqual(await ui.page.evaluate(() => [state.openFileId, state.selectedVersion]), [book.material.id, 1]);
-          await ui.page.locator("#dClose").click();
+          await openOriginalCell(ui.page, rows.nth(1).locator(".msg-body"), book.material.id);
         });
         for (const view of ["reconnect", "refresh", "reopen"]) {
           await t.test(`each search result after ${view}`, async () => {
@@ -558,9 +578,66 @@ sys.stdout.buffer.write(data.getvalue())
             assert.deepEqual(await answers(viewer.page).locator(".msg-body").allInnerTexts(), [original, historical]);
           });
         }
+
+        const question = "请用 transcript_search 查第1轮正式回答。请说明当时引用了哪个单元格，有材料版本时可以注明，只报告历史出处。";
+        for (const [variant, suffix] of ["", "（材料版本 v1）", "（材料版本 v2）"].entries()) {
+          await t.test(`reported source ${suffix || "without version"}`, async t => {
+            const text = `已交付回答引用的单元格是 [${filename}]Model!B2${suffix}。`;
+            const start = branch().length;
+            const model = scriptModel(entry, [
+              { toolId: `version-${variant}`, toolName: "transcript_search", tool: { query: queries[0], turn: 1 }, stopReason: "toolUse" },
+              { text, pause: true }, { text },
+            ]);
+            t.after(model.resume);
+            await ui.send(question);
+            await bounded(model.paused, "version follow-up did not reach its answer");
+            const hit = branch().slice(start).find(row => row.message?.toolName === "transcript_search").message.details;
+            assert.deepEqual(hit.matches, [match]);
+            const pending = entry.postAnswerRun;
+            // Keep the sender connected for live delivery. A second browser loses
+            // its connection with the answer still pending.
+            let peer;
+            if (variant === 1) {
+              peer = await open(t, transport);
+              await peer.select(id);
+              await peer.page.waitForFunction(() => state.streaming && Boolean(state.live.turnId));
+              await peer.context.setOffline(true);
+            }
+            model.resume();
+            const delivered = await bounded(pending, "version follow-up did not settle");
+            if (peer) await peer.context.setOffline(false);
+            const index = variant + 2;
+            const expected = variant === 2 ? ["failed", "", []] : ["completed", text, first.citations];
+            if (peer) {
+              coldCases.push({ transport, history, id, materialId: book.material.id, index,
+                expected: { turnId: delivered.turnId, status: "completed", text, citations: first.citations } });
+            }
+            assert.deepEqual([delivered.status, delivered.text, delivered.citations], expected);
+            assert.deepEqual(branch().slice(start).filter(e => e.customType === "pe_turn_delivery").map(e => e.data), [delivered]);
+            assert.deepEqual(publicAnswer((await snapshot())[index]), publicAnswer(delivered));
+            await checkReply(ui, delivered, index);
+            if (peer) {
+              await checkReply(peer, delivered, index);
+              await ui.reload(id);
+              const body = await checkReply(ui, delivered, index);
+              await openOriginalCell(ui.page, body, book.material.id);
+            }
+          });
+        }
       });
     }
   }
+  return async function checkRestartedHistory(t, origin) {
+    assert.equal(coldCases.length, 4);
+    for (const { transport, history, id, materialId, expected, index } of coldCases) {
+      await t.test(`Chrome ${transport} ${history}: exact versioned source after process restart`, async t => {
+        const ui = await open(t, transport, origin);
+        await ui.select(id);
+        const body = await checkReply(ui, expected, index);
+        await openOriginalCell(ui.page, body, materialId);
+      });
+    }
+  };
 }
 
 async function browserDeliveryTests(t, browser, app, base, json, restart) {
@@ -598,7 +675,9 @@ async function browserDeliveryTests(t, browser, app, base, json, restart) {
     return { context, page, ready, select, newSession, send, reload };
   };
 
-  await browserHistorySearch(t, { app, base, json, open, answers });
+  let coldServer;
+  const restartForColdChecks = () => coldServer ??= restart(t);
+  const checkHistoryAfterRestart = await browserHistorySearch(t, { app, base, json, open, answers });
 
   for (const transport of ["legacy", "agui"]) {
     for (const scenario of [rewrite, citedContinuation]) {
@@ -978,7 +1057,7 @@ async function browserDeliveryTests(t, browser, app, base, json, restart) {
     }
 
     await Promise.all([a.context.close(), b.context.close()]);
-    const childBase = await restart(t);
+    const childBase = await restartForColdChecks();
     for (const [transport, id, expected, pending] of [
       ["legacy", sessionA.id, "判断甲版", true], ["agui", sessionB.id, "判断乙版", false],
     ]) {
@@ -993,6 +1072,7 @@ async function browserDeliveryTests(t, browser, app, base, json, restart) {
       }
     }
   });
+  await t.test("historical sources restored by the new service", async t => checkHistoryAfterRestart(t, await restartForColdChecks()));
 }
 
 await test("real TCP SSE and browser turn delivery", async t => {
