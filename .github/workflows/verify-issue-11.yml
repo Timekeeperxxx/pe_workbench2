@@ -1,0 +1,50 @@
+name: Verify issue 11 context and evidence
+on:
+  push:
+    branches: ["ci/verify-issue-11-2380603"]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 2380603f4b45aa1b547dafface0261eecc53dd98
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.16.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install required test runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "2380603f4b45aa1b547dafface0261eecc53dd98"
+          npm ci
+          python -m pip install playwright==1.60.0 openpyxl pillow pymupdf
+          if ! command -v soffice >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install --no-install-recommends -y libreoffice-calc
+          fi
+          soffice --version
+          python -m playwright install --with-deps chromium
+          if ! command -v google-chrome >/dev/null; then python -m playwright install chrome; fi
+          echo "PE_BROWSER_PLAYWRIGHT=$(python -c 'import pathlib,playwright; print(pathlib.Path(playwright.__file__).parent/"driver/package/index.mjs")')" >> "$GITHUB_ENV"
+          echo "PYTHON_BIN=$(command -v python)" >> "$GITHUB_ENV"
+      - name: Replay real Pi requests under context limits
+        run: npm run test:context-budget
+      - name: Verify the turn, evidence and persistence contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$PE_BROWSER_PLAYWRIGHT"
+          npm run build:copilot-pilot
+          npm run test:turn-delivery | tee "$RUNNER_TEMP/turn.log"
+          grep -F "Chrome interleaved framework edits keep each session's verdict through process restart" "$RUNNER_TEMP/turn.log"
+          npm run test:systemic
+          npm run test:p1
+          npm run test:fact-memory
