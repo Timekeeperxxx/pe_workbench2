@@ -544,9 +544,17 @@ console.log('target deviation post-answer correction passed');
     const cellThenNoun = '第1轮回答引用的是 Acceptance13.xlsx 的 Model!B2 单元格（材料 ID ' + liveSource.materialId + '，版本 v1）。';
     const fullSpelling = '在本会话第1轮历史里，回答所引用的是 [Acceptance13.xlsx]Model!B2；'
       + '当文件名可能与其他文件重名时，应写作 [' + liveSource.materialId + '@v1]Model!B2，材料版本为 v1。';
+    const restated = '第1轮的交付回答引用的是 Acceptance13.xlsx，材料版本为 v1（材料 ID：' + liveSource.materialId
+      + '），单元格为 Model!B2；也就是说，本次引用为 [' + liveSource.materialId + '@v1]Model!B2。';
+    const prefixedVersion = '第 1 轮交付回答引用的工作簿是 Acceptance13.xlsx（材料 ID ' + liveSource.materialId
+      + '），材料版本为 v1；引用的坐标是 [Acceptance13.xlsx]Model!B2，因此带版本写作 [' + liveSource.materialId + '@v1]Model!B2。';
+    const canonical = '第 1 轮回答引用的是工作簿 Acceptance13.xlsx（材料 ID ' + liveSource.materialId
+      + '，版本 v1）中的 Model!B2 单元格；按来源规范记为 [' + liveSource.materialId + '@v1]Model!B2。';
+    const canonicalCorrection = '[Acceptance13.xlsx]Model!B2 在本会话第 1 轮回答中显示的出处是 Acceptance13.xlsx（材料 ID '
+      + liveSource.materialId + '，版本 v1）的 Model!B2 单元格，按来源规范记为 [' + liveSource.materialId + '@v1]Model!B2。';
     const listedSource = '第1轮回答的出处如下。\n- 文件名：Acceptance13.xlsx\n- 单元格：Model!B2\n- 材料版本：v1。';
     const namedFields = '第1轮回答引用的单元格为 Model!B2，工作簿名为 Acceptance13.xlsx，材料版本为 v1。';
-    for (const text of [cellThenNoun, fullSpelling, listedSource, namedFields, sourceReport + '。', sourceReport + '（材料版本 v1）。', sourceReport + '（材料第一版）。',
+    for (const text of [canonical, canonicalCorrection, restated, prefixedVersion, cellThenNoun, fullSpelling, listedSource, namedFields, sourceReport + '。', sourceReport + '（材料版本 v1）。', sourceReport + '（材料第一版）。',
       sourceReport + '（材料版本 ｖ１）。', sourceOnly, appendedVersion]) {
       const { record } = await runScript([{ search: liveSearch, text }], sourceQuestion);
       assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [liveSource]]);
@@ -554,6 +562,9 @@ console.log('target deviation post-answer correction passed');
     const otherVersion = { ...oldCite, version: 2, filename: 'Other.xlsx' };
     const twoVersions = { matches: [{ ...hit, citations: [liveSource, otherVersion] }] };
     for (const text of [
+      prefixedVersion.replace('材料版本为 v1', '材料版本为 v2'),
+      restated.replace('也就是说，本次引用为', '这证明了收入增长，引用为'),
+      prefixedVersion.replace(liveSource.materialId + '@v1]Model!B2', otherVersion.materialId + '@v2]Model!A1'),
       cellThenNoun.replace('版本 v1', '版本 v2'),
       cellThenNoun.replace('单元格（', '单元格，证明营收增长（'),
       fullSpelling.replace(liveSource.materialId + '@v1]Model!B2', otherVersion.materialId + '@v2]Model!A1').replace('材料版本为 v1', '材料版本为 v2'),
