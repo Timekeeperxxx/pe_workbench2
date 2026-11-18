@@ -82,7 +82,7 @@ function scriptModel(entry, steps) {
       }
     }
     const stopReason = opts.signal?.aborted ? "aborted" : step.stopReason ?? "stop";
-    const content = step.tool ? [{ type: "toolCall", id: `source-${count}`,
+    const content = step.tool ? [{ type: "toolCall", id: step.toolId ?? `source-${count}`,
       name: step.toolName || (step.tool === true ? source.name : "workbook_query"), arguments: step.tool === true ? {} : step.tool }]
       : [{ type: "text", text: step.text || "" }];
     const output = stopReason === "length" ? model.maxTokens : 10;
@@ -389,6 +389,180 @@ const citedContinuation = {
   ],
 };
 
+async function browserHistorySearch(t, { app, base, json, open, answers }) {
+  const filename = "Acceptance13.xlsx";
+  const workbook = value => execFileSync(process.env.PYTHON_BIN || "python3", ["-c", `
+import sys
+from io import BytesIO
+from openpyxl import Workbook
+book = Workbook()
+book.active.title = "Model"
+book.active["B2"] = int(sys.argv[1])
+data = BytesIO()
+book.save(data)
+sys.stdout.buffer.write(data.getvalue())
+`, String(value)]);
+  const initial = workbook(317);
+  const updated = workbook(911);
+  async function upload() {
+    const uploaded = await fetch(base + "/api/upload", { method: "POST", body: initial,
+      headers: { "x-file-name": filename, "content-type": "application/octet-stream" } });
+    assert.equal(uploaded.status, 201);
+    return uploaded.json();
+  }
+  const original = `最终稿B（字段名 isError）依据 [${filename}]Model!B2。`;
+  const historical = `历史检索命中。那条正式回答引用的是 [${filename}]Model!B2。`;
+  const internal = "用户还没有看到这份草稿";
+  const queries = ["最终稿B", "首稿A", internal];
+
+  function createOldHistory(book) {
+    const ctx = app.projectManager.get(app.config.defaultProjectId);
+    const manager = SessionManager.create(ctx.root, ctx.sessionsDir);
+    manager.appendModelChange(app.config.model.provider, app.config.model.id);
+    manager.appendSessionInfo("带原始引用的旧会话");
+    manager.appendMessage({ role: "user", content: "请核对单元格。", timestamp: Date.now() });
+    const answer = text => manager.appendMessage({ role: "assistant", stopReason: "stop",
+      timestamp: Date.now(), content: [{ type: "text", text }] });
+    answer(draft);
+    manager.appendCustomMessageEntry("pe_answer_correct", internal, false);
+    answer(original);
+    manager.appendCustomEntry("pe_answer_lint", { citations: [{
+      id: "legacy-cell", materialId: book.material.id, version: 1, filename, locator: "Model!B2", value: 317,
+    }] });
+    return manager.getSessionId();
+  }
+
+  // Check the content within each call. Its arguments, the answer body and a
+  // neighbouring result can all contain the search term or the same locator.
+  async function checkResults(group, calls, book) {
+    if (!(await group.evaluate(node => node.open))) await group.locator(":scope > summary").click();
+    assert.match(await group.innerText(), /Model!B2/, "expanded search must show the returned locator");
+    for (const [i, { toolCallId }] of calls.entries()) {
+      const card = group.locator(`[data-tool-call-id="${toolCallId}"].transcript-search-card`);
+      assert.ok(await card.isVisible(), `missing visible result for ${queries[i]}`);
+      const text = await card.innerText();
+      if (i === 0) {
+        assert.match(text, /历史问答命中\s*1\s*条/);
+        assert.match(text, /第\s*1\s*轮.*正式回答/);
+        assert.ok(text.replaceAll("**", "").includes(original), text);
+        assert.ok(await card.locator(`[data-material-id="${book.material.id}"][data-version="1"][data-locator="Model!B2"]`).isVisible());
+      } else {
+        assert.match(text, /历史问答未命中/);
+        assert.ok(!text.includes("Model!B2"), text);
+        assert.equal(await card.locator("[data-cell-cite]").count(), 0);
+      }
+    }
+  }
+
+  for (const transport of ["legacy", "agui"]) {
+    for (const history of ["managed", "old Pi"]) {
+      await t.test(`Chrome ${transport} ${history}: search delivered history`, async t => {
+        const book = await upload();
+        const oldId = history === "old Pi" && createOldHistory(book);
+        const ui = await open(t, transport);
+        let id;
+        if (oldId) {
+          id = oldId;
+          await ui.select(id);
+        } else {
+          ({ id } = await ui.newSession());
+          const entry = app.live.get(id);
+          scriptModel(entry, [
+            { tool: { path: book.path, query: "Model!B2", sheet: "Model" }, stopReason: "toolUse" },
+            { text: draft }, { text: original },
+          ]);
+          await ui.send("请核对单元格。");
+          await answers(ui.page).first().locator(".msg-body").getByText(original, { exact: true }).waitFor();
+          assert.ok(entry.session.sessionManager.getBranch().some(row =>
+            row.customType === "pe_answer_correct" && JSON.stringify(row.content).includes(internal)));
+        }
+        const snapshot = async () => (await json(`/api/sessions/${id}/state`)).messages.filter(m => m.role === "assistant");
+        const [first] = await snapshot();
+        assert.equal(first.text, original);
+        assert.deepEqual(first.citations.map(({ materialId, version, locator }) => ({ materialId, version, locator })),
+          [{ materialId: book.material.id, version: 1, locator: "Model!B2" }]);
+        // The original citation must still open v1 even after the same material changes.
+        const ctx = app.projectManager.get(app.config.defaultProjectId);
+        await writeFile(join(ctx.root, book.path), updated);
+        const changed = ctx.store.indexFile(book.path);
+        assert.equal(changed.id, book.material.id);
+        assert.equal(changed.versions[0].v, 2);
+        const grid = await json(`/api/materials/${book.material.id}/versions/2/workbook/sheets/Model`);
+        assert.equal(grid.cells.find(([r, c]) => r === 2 && c === 2)[2], 911);
+        await ui.reload(id);
+        await ui.page.waitForFunction(id => state.files.some(f =>
+          f.id === id && f.versions.some(version => version.v === 2)), book.material.id);
+        const entry = app.live.get(id);
+        const branch = () => entry.session.sessionManager.getBranch();
+        const before = branch().length;
+        const model = scriptModel(entry, [
+          ...queries.map((query, i) => ({ toolId: `recall-${i}`, toolName: "transcript_search",
+            tool: { query, turn: 1 }, stopReason: "toolUse" })),
+          { text: historical, pause: true }, { text: historical },
+        ]);
+        t.after(model.resume);
+        await ui.send("第一轮正式回答当时引用了哪个单元格？");
+        await bounded(model.paused, "history search did not settle");
+        const pending = entry.postAnswerRun;
+        const calls = branch().slice(before).map(row => row.message)
+          .filter(m => m?.role === "toolResult" && m.toolName === "transcript_search");
+        assert.equal(calls.length, 3);
+        assert.equal(new Set(calls.map(call => call.toolCallId)).size, 3);
+        assert.deepEqual(calls.map(call => call.details.totalMatches), [1, 0, 0]);
+        for (const call of calls) assert.deepEqual(call.details.coverage.turns, [1]);
+        const [match] = calls[0].details.matches;
+        assert.deepEqual([match.turn, match.role, match.excerpt.replaceAll("**", "")], [1, "assistant", original]);
+        assert.deepEqual(match.citations, first.citations);
+
+        await t.test("completed calls visible during the live turn", async () => {
+          const group = ui.page.locator("#liveTools .tool-group");
+          await group.locator(".tool-row.done").nth(2).waitFor({ state: "attached" });
+          await checkResults(group, calls, book);
+        });
+        await ui.context.setOffline(true);
+        model.resume();
+        const record = await bounded(pending, "disconnection prevented the history reply from settling");
+        await ui.context.setOffline(false);
+        const [prior, followup] = await snapshot();
+        assert.deepEqual(prior.citations, first.citations);
+        assert.deepEqual(publicAnswer(followup), publicAnswer(record));
+        assert.deepEqual(branch().slice(before).filter(e => e.customType === "pe_turn_delivery").map(e => e.data), [record]);
+        for (const [i, tool] of followup.tools.entries()) {
+          assert.equal(tool.id, calls[i].toolCallId);
+          assert.deepEqual(JSON.parse(tool.output).matches, calls[i].details.matches);
+        }
+        assert.equal(followup.tools.length, 3);
+        await t.test("historical citation delivered once and opens the original cell", async () => {
+          assert.deepEqual([record.status, record.text, record.citations], ["completed", historical, first.citations]);
+          const rows = answers(ui.page);
+          await rows.nth(1).locator(".msg-body").getByText(historical, { exact: true }).waitFor();
+          await ui.ready();
+          assert.deepEqual(await rows.locator(".msg-body").allInnerTexts(), [original, historical]);
+          await rows.nth(1).locator(".msg-body [data-cell-cite]").click();
+          const cell = ui.page.locator('#xlsxSheet .xlsx-c.is-sel[data-r="2"][data-c="2"]');
+          await cell.waitFor();
+          assert.equal(await cell.innerText(), "317");
+          assert.equal(await ui.page.locator('#xlsxTabs [aria-selected="true"]').innerText(), "Model");
+          assert.deepEqual(await ui.page.evaluate(() => [state.openFileId, state.selectedVersion]), [book.material.id, 1]);
+          await ui.page.locator("#dClose").click();
+        });
+        for (const view of ["reconnect", "refresh", "reopen"]) {
+          await t.test(`each search result after ${view}`, async () => {
+            if (view === "refresh") await ui.reload(id);
+            const viewer = view === "reopen" ? await open(t, transport) : ui;
+            if (view === "reopen") await viewer.select(id);
+            const row = answers(viewer.page).nth(1);
+            await row.waitFor();
+            await viewer.ready();
+            await checkResults(row.locator(".tool-group"), calls, book);
+            assert.deepEqual(await answers(viewer.page).locator(".msg-body").allInnerTexts(), [original, historical]);
+          });
+        }
+      });
+    }
+  }
+}
+
 async function browserDeliveryTests(t, browser, app, base, json, restart) {
   const answers = page => page.locator("#thread .msg.assistant:not(#liveMsg)");
   const open = async (t, transport, origin = base) => {
@@ -423,6 +597,8 @@ async function browserDeliveryTests(t, browser, app, base, json, restart) {
     }
     return { context, page, ready, select, newSession, send, reload };
   };
+
+  await browserHistorySearch(t, { app, base, json, open, answers });
 
   for (const transport of ["legacy", "agui"]) {
     for (const scenario of [rewrite, citedContinuation]) {

@@ -38,6 +38,87 @@ export function adoptedCitations(text, available) {
   return [...used.values()];
 }
 
+// A search hit vouches for what an earlier answer cited. It supplies a
+// versioned link in a source report, never a fresh reading of that cell.
+const HISTORY = /历史|前文|此前|先前|之前|当时|原文|原答|已交付|[上首前]一?[轮次]|第\s*[一二三四五六七八九十百\d]+\s*[轮次]|那[条份次个](?:正式)?(?:回[答复]|答[文案])|\b(?:previous|prior|earlier|original|last)\b/i;
+const REFERENCE = /引用|援引|出处|出自|来源|依据|定位|单元格|坐标|\b(?:cit(?:e[ds]?|ation)|refer(?:ence[ds]?|red)?|cell|source)\b/i;
+// An elliptical reply to a provenance question can just name the source.
+// Keep this fallback narrow: e.g. “收入有望增长，依据 …” asserts a fact.
+const SOURCE_ONLY = /^[\s`*_]*(?:(?:它|其|所)?(?:引用|援引)(?:的)?(?:单元格|坐标)?|(?:该|对应的?)?(?:出处|来源|单元格|坐标))?(?:就?是|为|在)?[\s`*_。、，,：:！!.]*$/i;
+
+// Every locator must be the object of the source report. In “the old
+// answer cited A1, which proves revenue grew” a citation cannot verify growth.
+const REPORTED_CELL = /(?:引用|援引|出处|出自|指向|依据|来源|坐标|单元格|cit(?:ed|ation)|refer(?:red to|enced)|source|cell)\s*(?:的|是|为|在|了|就是|is|was|:|：|\s)*$/i;
+
+function reportsHistoricalSource(part, refs, question, cells) {
+  let description = part.replace(new RegExp(LOCATOR_SOURCE, 'g'), ' ');
+  // Counts, turn labels and original source metadata can contain digits.
+  for (const cell of cells) {
+    for (const name of [cell.filename, cell.materialId + '@v' + cell.version]) {
+      if (name) description = description.replaceAll(name, ' ');
+    }
+  }
+  const historicalSubject = HISTORY.test(description);
+  description = description.replace(/第\s*\d+\s*[轮次]|\bturn\s*#?\d+|\d+\s*条(?=\s*(?:命中|记录|结果|[，,。；;]|$))/gi, ' ');
+  if (/\d|当前|现在|最新|现价|[零〇一二两三四五六七八九十百千万亿]+(?:元|美元|港元|%)|\b(?:current|now|latest)\b/i.test(description)) return false;
+  if (HISTORY.test(question) && REFERENCE.test(question) && SOURCE_ONLY.test(description.trim())) return true;
+  if (!historicalSubject && !(HISTORY.test(question) && /回[答复]|答[文复案]|\b(?:reply|answer)\b/i.test(description))) return false;
+  return refs.every(({ raw, index }) => {
+    let prefix = part.slice(0, index).replace(/[`*_]/g, '').trimEnd();
+    for (const { filename } of cells) if (filename) prefix = prefix.replaceAll(filename, '').trimEnd();
+    const suffix = part.slice(index + raw.length).replace(/[`*_]/g, '').trim();
+    // Keep the link in the report itself (including a trailing source ID).
+    // “The old answer cited B2, proving that …” also makes a new claim.
+    const sourceTail = /^[。，,；;！.!）)\s]*$/.test(suffix) || /^[（(，,]\s*(?:材料|文件|版本|来源|material|file|version)/i.test(suffix);
+    const sourceFirst = /^(?:是|为|was|is).*(?:引用|援引|referenced|cited)(?:的(?:单元格|坐标|出处))?[。.!！]?$/i.test(suffix);
+    return (REPORTED_CELL.test(prefix) && sourceTail) || sourceFirst;
+  });
+}
+
+function explicitTurns(text) {
+  const digits = '零一二三四五六七八九';
+  const turns = new Set();
+  for (const match of text.matchAll(/第\s*([零一二三四五六七八九十百千\d]+)\s*[轮次]|\bturn\s*#?(\d+)/gi)) {
+    const label = match[1] || match[2];
+    if (/^\d+$/.test(label)) { turns.add(Number(label)); continue; }
+    let number = 0;
+    let digit = 0;
+    for (const ch of label) {
+      const unit = { 十: 10, 百: 100, 千: 1000 }[ch];
+      if (unit) {
+        number += (digit || 1) * unit;
+        digit = 0;
+      } else {
+        digit = digits.indexOf(ch);
+      }
+    }
+    turns.add(number + digit);
+  }
+  if (/首轮/.test(text)) turns.add(1);
+  return turns;
+}
+
+export function reportedLocatorEvidence(text, question, current, matches) {
+  if (!matches.length) return current;
+  const requested = explicitTurns(question);
+  const allowed = matches.filter(match => !requested.size || requested.has(match.turn));
+  const used = new Set(current);
+  for (const { parts } of answerBlocks(text)) {
+    for (const part of parts) {
+      const refs = extractLocatorMatches(part);
+      if (!refs.length) continue;
+      const reported = explicitTurns(part);
+      const cells = allowed.filter(match => !reported.size || reported.has(match.turn)).flatMap(match => match.citations);
+      const evidence = cells.length && reportsHistoricalSource(part, refs, question, cells) ? [...current, ...cells] : current;
+      const lookup = citationLookup(evidence);
+      // Do not let a link admitted by another sentence cover this one.
+      if (refs.some(ref => !resolveLocatorToken(ref.raw, lookup)?.citation)) return current;
+      for (const cell of adoptedCitations(part, evidence)) used.add(cell);
+    }
+  }
+  return [...used];
+}
+
 export function joinContinuation(prefix, delta) {
   if (!prefix || delta.startsWith(prefix)) return delta;
   const continuation = delta.trimStart();
@@ -177,13 +258,13 @@ export function blockingFinding(finding) {
 
 // On exhaustion or interruption only release complete, separately sourced
 // sentences or table rows that pass the same factual checks alone and together.
-export function verifiedPortion(blocks, available, findingsFor, coverage) {
+export function verifiedPortion(blocks, evidenceFor, findingsFor, coverage) {
   const verified = [];
   for (const { header, parts } of blocks) {
     const kept = parts.filter(part => {
       if (coverage.unsupported.has(part) || (coverage.missing.length && !coverage.supported.has(part))) return false;
       const sourced = coverage.verifiedEndings.has(part) ||
-        (/[。！？.!?]$/.test(part) && adoptedCitations(part, available).length);
+        (/[。！？.!?]$/.test(part) && adoptedCitations(part, evidenceFor(part)).length);
       return sourced && !findingsFor(part).some(blockingFinding);
     });
     if (kept.length) verified.push([...(header ? [header] : []), ...kept].join('\n'));

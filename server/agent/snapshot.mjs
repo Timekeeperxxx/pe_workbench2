@@ -5,6 +5,7 @@
  */
 
 import path from "node:path";
+import {toolDisplayOutput} from "../../lib/tool-display-output.mjs";
 import {applyPatch} from "diff";
 import {turnTimeline} from "./turn-delivery.mjs";
 import {adoptedCitations, joinContinuation} from "./answer-delivery.mjs";
@@ -246,13 +247,13 @@ function toolCitationIndex(ctx, threadId) {
     .map(record => [record.toolCallId, record.citations]));
 }
 
-function legacyAnswerCitations(turn, text, tools) {
+function legacyAnswerCitations(turn, text, tools, onlyAdopted = turn.revisions?.length) {
   const byId = new Map();
   for (const cite of [...(turn.lint?.citations || []), ...tools]) {
     if (!byId.has(cite.id)) byId.set(cite.id, cite);
   }
   const candidates = [...byId.values()];
-  return turn.revisions?.length ? adoptedCitations(text, candidates) : candidates;
+  return onlyAdopted ? adoptedCitations(text, candidates) : candidates;
 }
 
 // Shape expected by transcript_search. Do not expose tool output or internal
@@ -269,7 +270,7 @@ export function transcriptMessages(session, ctx, options = {}) {
     if (!turn.start) {
       citationsByCall ??= toolCitationIndex(ctx, session.sessionId);
       answer.citations = legacyAnswerCitations(turn, answer.text, turn.messages.flatMap(m =>
-        m.role === "toolResult" ? citationsByCall.get(m.toolCallId) ?? m.details?.citations ?? [] : []));
+        m.role === "toolResult" && !m.isError ? citationsByCall.get(m.toolCallId) ?? m.details?.citations ?? [] : []), true);
     }
     out.push({
       role: "assistant", content: answer.text,
@@ -414,7 +415,7 @@ export function snapshotMessages(session, ctx, entry = null) {
         name: block.name,
         detail: toolDetail(ctx, block.name, block.arguments || {}),
         status: result ? (result.isError ? "error" : "done") : !turn.start ? "done" : turn.delivery ? "error" : "running",
-        output: result ? resultText(result).slice(0, 4000) : "",
+        output: result ? toolDisplayOutput(block.name, result, resultText(result)) : "",
         ...(citations.length ? { citations } : {}),
         ...(presentation ? { presentation } : {}),
         ...(presentationError ? { presentationError } : {}),

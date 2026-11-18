@@ -82,3 +82,32 @@ console.log('transcript search PASS');
   assert.ok(result.content[0].text.length <= 12000);
   assert.deepEqual(result.details.matches[0].citations, citations);
 }
+
+{
+  const {toolDisplayOutput} = await import('../lib/tool-display-output.mjs');
+  const {renderToolPresentation} = await import('../ui/tool-renderers/registry.js');
+  const citation = {
+    id: 'original', materialId: 'book', filename: '<img src=x>.xlsx', locator: 'Model!B2', version: 1,
+  };
+  const tool = createTranscriptSearchTool({ getMessages: () => [
+    { role: 'user', content: '问题' },
+    { role: 'assistant', content: '<img src=x> 出处 Model!B2', citations: [citation] },
+  ], getLedger: () => ({ topics: ['L'.repeat(13000)] }) });
+  const result = await tool.execute('search', { query: '出处' });
+  // The model drops detailed citations at its own budget. The historical
+  // source in the process must survive even when its ledger fills the output.
+  assert.equal(JSON.parse(result.content[0].text).citationDetailsOmitted, true);
+  const output = toolDisplayOutput('transcript_search', result, result.content[0].text);
+  assert.ok(output.length <= 4000);
+  const card = renderToolPresentation({id: 'search', name: 'transcript_search', status: 'done', output});
+  assert.match(card, /历史问答命中 1 条/);
+  assert.match(card, /&lt;img src=x&gt; <mark>出处<\/mark> Model!B2/);
+  assert.doesNotMatch(card, /<img|L{50}/);
+  assert.match(card, /data-material-id="book" data-version="1" data-locator="Model!B2"/);
+  const versionless = JSON.parse(output);
+  delete versionless.matches[0].citations[0].version;
+  const oldCard = renderToolPresentation({id: 'old', name: 'transcript_search', status: 'done', output: JSON.stringify(versionless)});
+  assert.match(oldCard, /Model!B2/);
+  assert.doesNotMatch(oldCard, /data-cell-cite/);
+
+}

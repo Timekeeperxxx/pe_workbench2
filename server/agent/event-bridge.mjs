@@ -7,6 +7,7 @@
  */
 
 import path from "node:path";
+import { toolDisplayOutput } from "../../lib/tool-display-output.mjs";
 
 import { newRunId } from "../../lib/agent-protocol/ids.mjs";
 import { extractPresentation } from "../../lib/contracts/index.mjs";
@@ -129,7 +130,7 @@ export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, on
           name: event.toolName,
           status: event.isError ? "error" : "done",
           detail: toolDetail(entry.ctx, event.toolName, args),
-          output: resultText(event.result).slice(0, 4000),
+          output: toolDisplayOutput(event.toolName, event.result, resultText(event.result)),
           ...(citations.length ? { citations } : {}),
           ...(presentation ? { presentation } : {}),
           ...(presentationError ? { presentationError } : {}),

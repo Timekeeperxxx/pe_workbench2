@@ -49,7 +49,7 @@ function citationTitle(citation) {
   return `打开 ${parts.join(" · ")}`;
 }
 
-function citationButton(citation, label) {
+export function citationButton(citation, label) {
   const version = Number(citation.version);
   const locator = normalizeLocator(citation.locator) || String(citation.locator);
   const attrs = [

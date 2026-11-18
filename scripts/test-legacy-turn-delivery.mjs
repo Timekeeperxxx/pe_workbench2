@@ -91,6 +91,17 @@ await test("Pi legacy correction restores only the replacement and its citations
   assert.deepEqual((await query("改稿"))[0]?.citations, [citeB]);
 });
 
+await test("a legacy transcript hit carries only sources used by the final answer", async t => {
+  const f = await fixture(t);
+  f.user("核对两格。");
+  f.tool("unused", citeA);
+  f.tool("used", citeB);
+  f.assistant(revision);
+  f.lint([citeA, citeB]);
+  const { query } = await f.restore();
+  assert.deepEqual((await query("改稿"))[0].citations, [citeB]);
+});
+
 for (const fragment of ["", "取消前留下半句"]) {
   await test(`Pi legacy cancellation restores ${fragment ? "the fragment" : "an empty answer"}`, async t => {
     const f = await fixture(t);

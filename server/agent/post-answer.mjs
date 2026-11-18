@@ -6,13 +6,14 @@ import { recordUserClaims } from '../../lib/claim-detect.mjs';
 import { randomUUID } from 'node:crypto';
 import { lintAnswer, lintLedgerAnswer, answerStats, asksDeviationQuestion, contextModelTarget } from '../../lib/answer-lint.mjs';
 import { collectCitationsFromToolCalls, rehydrateCitations } from '../../lib/citations.mjs';
+import { validCitations } from '../../lib/contracts/citation.mjs';
 import { markStaleVersions, registerToolResult } from '../../lib/fact-register.mjs';
 import { frameworkForTurn, textOfContent } from './snapshot.mjs';
 import { indexJson, locateChatTopics, recentTopicDialogue } from './topic-locator.mjs';
 import { updateTopicsFromFacts } from '../../lib/topic-index.mjs';
 
 import { activateQueuedTurn, startTurn, saveTurnDelivery } from './turn-delivery.mjs';
-import { adoptedCitations, answerBlocks, answerGaps, blockingFinding, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
+import { adoptedCitations, answerBlocks, answerGaps, blockingFinding, reportedLocatorEvidence, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
 import { presentUserAnswer } from '../../ui/chat/user-facing-answer.js';
 import { CONTEXT_BUDGET_FAILURE, isContextBudgetError } from '../../lib/context-budget.mjs';
 
@@ -174,6 +175,11 @@ async function generateAnswer(entry, promptText, options, active) {
         if (call.success) successful.set(call.id, call);
       }
       const thisTurnCitations = collectCitationsFromToolCalls([...successful.values()].reverse());
+      const historical = [...successful.values()].filter(call => call.name === 'transcript_search')
+        .flatMap(call => call.details?.matches || [])
+        .filter(match => match?.role === 'assistant' && Number.isInteger(match.turn))
+        .map(match => ({ turn: match.turn, citations: validCitations(match.citations).filter(cite => cite.version) }));
+
       const currentVersions={...(entry.materialVersions||{})};
       for (const c of thisTurnCitations.toReversed()) if (c.materialId && c.version) currentVersions[c.materialId] = c.version;
       await markStaleVersions(entry.ctx?.root,entry.id,currentVersions).catch(()=>0);
@@ -189,10 +195,12 @@ async function generateAnswer(entry, promptText, options, active) {
       const blocks = answerBlocks(answer);
       const workbookTurn = active.attachments?.some(path => /\.xls[xm]$/i.test(path)) || workbookReads.length > 0;
       const coverage = workbookItemCoverage(text, blocks, workbookEvidence, workbookTurn);
+      const locatorEvidence = candidate => reportedLocatorEvidence(candidate, text, turnCitations, historical);
+      const available = locatorEvidence(answer);
       const findingsFor = (candidate, checkContext = lintContext) => {
         const lastLine = candidate.slice(candidate.lastIndexOf('\n') + 1);
         const endsWithVerifiedValue = coverage.verifiedEndings.has(lastLine);
-        const lint = lintAnswer(candidate, checkContext).filter(finding =>
+        const lint = lintAnswer(candidate, { ...checkContext, locatorCitations: candidate === answer ? available : locatorEvidence(candidate) }).filter(finding =>
           finding.rule !== 'incomplete' || finding.message !== '句末可能截断' || !endsWithVerifiedValue);
         return [
           ...lintFactIdentity(candidate, entry.ctx?.factMemory, { question: text }),
@@ -204,7 +212,7 @@ async function generateAnswer(entry, promptText, options, active) {
         ];
       };
       const findings = findingsFor(answer);
-      const adopted = adoptedCitations(answer, turnCitations);
+      const adopted = adoptedCitations(answer, available);
       const adoptedIds = new Set([...adopted.map(citation => citation.id), ...coverage.evidenceIds]);
       const candidateCalls = [...scanned.filter(call => call.messageIndex >= candidateMessageStart), ...toolCalls.slice(candidateCallStart)];
       const lastVerifiedRead = candidateCalls.findLastIndex(call => call.name === 'workbook_query' && call.success &&
@@ -219,7 +227,7 @@ async function generateAnswer(entry, promptText, options, active) {
       const data = {
         version: 1, turnId, timestamp: new Date().toISOString(),
         findings, stats: answerStats(answer), correctionCount, continuationCount,
-        citations: turnCitations,
+        citations: available,
         messageIndex: entry.session.messages.lastIndexOf(message),
       };
       // Custom entries are durable metadata, never model-visible chat messages.
@@ -237,9 +245,9 @@ async function generateAnswer(entry, promptText, options, active) {
         (call.name !== 'workbook_query' || candidateCalls.lastIndexOf(call) >= lastVerifiedRead));
       const toolGap = failedTool ? `工具 ${failedTool.name} 执行失败。` : '';
       if (blocking.length || !answer || toolGap) {
-        safeText = verifiedPortion(blocks, turnCitations,
+        safeText = verifiedPortion(blocks, locatorEvidence,
           part => findingsFor(part, { ...lintContext, requiredSections: [] }), coverage);
-        safeCitations = adoptedCitations(safeText, turnCitations);
+        safeCitations = adoptedCitations(safeText, locatorEvidence(safeText));
       } else {
         return { status: 'completed', text: answer, citations: adopted };
       }

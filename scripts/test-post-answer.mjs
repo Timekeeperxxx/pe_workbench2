@@ -415,7 +415,7 @@ console.log('target deviation post-answer correction passed');
   const { saveTurnDelivery } = await import('../server/agent/turn-delivery.mjs');
   const suiteRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'pe-delivery-'));
 
-  async function runScript(steps) {
+  async function runScript(steps, question = '请回答问题。') {
     const manager = SessionManager.create(suiteRoot, suiteRoot);
     const messages = [];
     const listeners = new Set();
@@ -434,14 +434,14 @@ console.log('target deviation post-answer correction passed');
       emit({ type: 'agent_start' });
       try {
         if (step.error) throw new Error(step.error);
-        if (step.citations || step.toolError) {
+        if (step.citations || step.search || step.toolError) {
           const toolCallId = 'tool-' + attempts;
-          const toolName = 'workbook_query';
+          const toolName = step.search ? 'transcript_search' : 'workbook_query';
           append({ role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: toolCallId, name: toolName, arguments: {} }] });
           emit({ type: 'tool_execution_start', toolCallId, toolName, args: {} });
           const result = {
             role: 'toolResult', toolName, toolCallId, isError: Boolean(step.toolError),
-            content: [{ type: 'text', text: step.toolError || 'ok' }], details: { citations: step.citations || [] },
+            content: [{ type: 'text', text: step.toolError || 'ok' }], details: step.search || { citations: step.citations || [] },
           };
           append(result);
           emit({ type: 'tool_execution_end', toolCallId, toolName, result, isError: result.isError });
@@ -470,7 +470,7 @@ console.log('target deviation post-answer correction passed');
       },
     };
     const entry = { id: manager.getSessionId(), ctx: { root: suiteRoot }, session };
-    const record = await runWithPostAnswer(entry, '请回答问题。');
+    const record = await runWithPostAnswer(entry, question);
     assert.equal(attempts, steps.length, 'bounded attempts');
     const metadata = type => manager.getBranch().filter(item => item.type === 'custom' && item.customType === type).map(item => item.data);
     assert.deepEqual(metadata('pe_turn_delivery'), [record]);
@@ -512,6 +512,55 @@ console.log('target deviation post-answer correction passed');
 
     const oldCite = { id: 'old', materialId: 'm', version: 1, locator: 'Model!A1' };
     const newCite = { id: 'new', materialId: 'm', version: 1, locator: 'Model!B2', value: 35, display_unit: '亿元' };
+    const historicalText = '上一轮正式回答引用的是 [m]Model!B2。';
+    const hit = { turn: 1, role: 'assistant', excerpt: '最终稿使用 [m]Model!B2。', citations: [newCite] };
+    const search = { matches: [hit], totalMatches: 1 };
+    const recalled = await runScript([{ search, text: historicalText }]);
+    assert.equal(recalled.record.status, 'completed');
+    assert.deepEqual(recalled.record.citations, [newCite]);
+    assert.deepEqual(recalled.entry.citationIndex, [], 'previous versions must stay out of the current evidence index');
+
+    const sourceQuestion = '第一轮正式回答当时引用了哪个单元格？';
+    const liveSource = { ...newCite, filename: 'Acceptance13.xlsx', materialId: '02cdf096-6b1f-40ea-8d69-6ee87fec0537' };
+    const liveSearch = { matches: [{ ...hit, citations: [liveSource] }], totalMatches: 1 };
+    const liveAnswer = '命中 1 条，在第 1 轮由助手给出的回答中：该回答引用的单元格是 [Acceptance13.xlsx]Model!B2，材料 ID 为 '
+      + liveSource.materialId + '@v1。台账中与“字面常量”这条查询相关的记录为 0 条。';
+    for (const text of [liveAnswer, '引用的是 [Acceptance13.xlsx]Model!B2。',
+      '第一轮正式回答引用的是 Acceptance13.xlsx 的 [Acceptance13.xlsx]Model!B2。',
+      '[Acceptance13.xlsx]Model!B2 是第一轮回答引用的单元格。']) {
+      const { record } = await runScript([{ search: liveSearch, text }], sourceQuestion);
+      assert.equal(record.status, 'completed');
+      assert.deepEqual(record.citations, [liveSource]);
+    }
+
+    // Same coordinate, value and material as the positive case. Only the
+    // original delivered assistant match can support reporting its source.
+    for (const [details, text] of [
+      [{ matches: [], ledgerMatches: [hit] }, historicalText],
+      [{ matches: [{ ...hit, role: 'user' }] }, historicalText],
+      [{ matches: [{ ...hit, turn: 2 }] }, '第一轮正式回答引用的是 [m]Model!B2。'],
+      [{ matches: [{ ...hit, citations: [oldCite] }] }, historicalText],
+      [{ matches: [{ ...hit, citations: [{ ...newCite, version: undefined }] }] }, historicalText],
+      [search, '当前收入是35亿元，依据 [m]Model!B2。'],
+      [search, '根据历史检索命中的出处，这个单元格的值是三十五（[m]Model!B2）。'],
+      [search, '上一轮引用的 [m]Model!B2 显示收入持续增长。'],
+      [search, '上一轮引用的 [m]Model!B2，显示收入持续增长。'],
+      [search, '该值为三十五元，沿用之前引用的 [m]Model!B2。'],
+      [search, '收入有望增长，依据 [m]Model!B2。'],
+      [search, '历史检索命中。该值为三十五元，依据 [m]Model!B2。'],
+      [search, '现在该单元格的值为35，依据 [m]Model!B2。'],
+      [search, '第一轮正式回答引用的是 [m@v2]Model!B2。'],
+    ]) {
+      const { record } = await runScript([{ search: details, text }, { text }], sourceQuestion);
+      assert.equal(record.status, 'failed', text);
+      assert.deepEqual(record.citations, []);
+    }
+    const mixedReport = historicalText + '\n当前收入是35亿元，依据 [m]Model!B2。';
+    const partialReport = await runScript([{ search, text: mixedReport }, { text: mixedReport }]);
+    assert.equal(partialReport.record.status, 'partial');
+    assert.equal(partialReport.record.text, historicalText);
+    assert.deepEqual(partialReport.record.citations, [newCite]);
+
     const corrected = await runScript([
       { text: '初稿 A：见 Model!A1 和 Fake!C9。', citations: [oldCite] },
       { text: '新稿 B：收入为35亿元，见 Model!B2。', citations: [newCite] },
