@@ -19,7 +19,8 @@ try {
  const check=(name,file)=>entry.session.agent.beforeToolCall({toolCall:{name},args:{path:file}});
  for(const file of ['.pi/ledger/x.json','exports/fact-memory/F/r1/report.md','alias/F/r1/report.md','external/secret.txt'])assert.equal((await check('write',file)).block,true,file);
  assert.equal((await check('read','external/secret.txt')).block,true);
- assert.equal(await check('write','exports/draft.md'),undefined);
+ assert.equal(await check('write','drafts/draft.md'),undefined);
+ assert.match((await check('write','exports/draft.md')).reason,/review_research/);
  assert.ok(entry.sessionTools.some(t=>t.name==='fact_query'));assert.ok(entry.sessionTools.some(t=>t.name==='framework_commit'));
  const automatic=await service.createEntry({ctx,automated:true});
  assert.deepEqual(automatic.sessionTools.map(t=>t.name),['fact_query']);

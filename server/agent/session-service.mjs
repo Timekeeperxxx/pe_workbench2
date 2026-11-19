@@ -7,11 +7,15 @@ import { createFactMemoryTools, withFactCapture } from '../../lib/fact-memory/to
  * handlers only parse HTTP input and call these methods.
  */
 
+import {auditResearch} from "../../lib/research-audit.mjs";
+import { guardResearchDelivery } from "../../lib/research-delivery.mjs";
+import {createResearchReview} from "../../lib/research-review.mjs";
 import fs from "node:fs";
 import {readLedger} from "../../lib/ledger.mjs";
 import {createLedgerTool} from "../../lib/ledger-tool.mjs";
 import {createTranscriptSearchTool} from "../../lib/transcript-search-tool.mjs";
 import path from "node:path";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -30,6 +34,7 @@ import {
   transcriptMessages,
   titleFromMessages,
 } from "./snapshot.mjs";
+import { assessContextBudget, contextBudgetFailureStream, fitContextMessages } from "../../lib/context-budget.mjs";
 import { systemHint } from "../project-context.mjs";
 
 export function createSessionService({
@@ -142,6 +147,9 @@ export function createSessionService({
     const restoredName = restoredManager?.getSessionName?.() || "";
     if (/^\[(计划|跟踪|盯)\]/.test(restoredName)) automated = true;
     if (/^\[盯\]/.test(restoredName) && !writeRoots) writeRoots = [".watch/"];
+    const researchReview = createResearchReview({ctx,
+      authorizeWrite: args => blockOutsideProject(ctx, "write", args) ?? blockOutsideWriteRoots(ctx, "write", args, writeRoots),
+    });
     let session;
     let entry;
     const metadata=()=>({session_id:session?.sessionId || id || '',run_id:entry?.localRunId || '',turn:session?.messages?.filter(m=>m.role==='user'&&!m.peInternal&&!m.customType).length || 0,actor:automated||writeRoots?'automation':'agent'});
@@ -170,28 +178,69 @@ export function createSessionService({
         thinkingLevel: "off",
         sessionManager,
         resourceLoader: loader,
-        tools: [...config.toolNames, ...sessionTools.map(t => t.name)],
+        tools: [...config.toolNames, "review_research", ...sessionTools.map(t => t.name)],
         customTools: ctx.tools
           .map(tool => withFactCapture(tool, ctx.factMemory, metadata))
-          .concat(sessionTools, createFrameworkEditTool(ctx.root, () => entry?.activeTurn)),
+          .concat(researchReview.tool, sessionTools, createFrameworkEditTool(ctx.root, () => entry?.activeTurn)),
       });
       session = created.session;
-      if (config.modelPayload) {
-        const stream = session.agent.streamFunction;
-        session.agent.streamFunction = (model, context, options) => stream(model, context, {
+      const stream = session.agent.streamFunction;
+      session.agent.streamFunction = (model, context, options) => {
+        const transcript = normalizeContext(context);
+        const messages = fitContextMessages(transcript.messages, model, undefined, options?.maxTokens);
+        if (!assessContextBudget(messages, model, options?.maxTokens).ok) return contextBudgetFailureStream(model);
+        const request = { messages };
+        if (!config.modelPayload) return stream(model, request, options);
+        return stream(model, request, {
           ...options,
           onPayload: async (payload, requestModel) => {
             const transformed = await options?.onPayload?.(payload, requestModel);
             return config.modelPayload(transformed ?? payload, requestModel);
           },
         });
-      }
+      };
+      researchReview.restoreEvidence(session.messages);
+      // Use the configured provider for review and repair requests as well as chat.
+      const provider = session.agent.streamFunction;
+      const recordAudit = record => {
+        fs.appendFileSync(path.join(ctx.root, ".pi", "research-audit.jsonl"), JSON.stringify(record) + "\n");
+      };
+      session.agent.streamFunction = guardResearchDelivery(provider, {
+        recordAudit,
+        getSessionMessages: () => session.messages,
+        getContinuation: () => entry?.activeTurn?.continueResearchAnswer,
+        audit: (source, model, context, options, draft) =>
+          auditResearch(source, model, context, options, draft, { workbookEvidence: researchReview.evidenceSnapshot() }),
+        onContext: (model, context, options) => {
+          researchReview.restoreEvidence(context.messages);
+          researchReview.setAuditor(async (content, extra) => {
+            const verdict = await auditResearch(provider, model, context, options, content, {
+              ...extra, workbookEvidence: researchReview.evidenceSnapshot(),
+            });
+            recordAudit({ ...verdict, kind: "report", at: new Date().toISOString() });
+            return verdict;
+          });
+        },
+      });
     }
 
     session.agent.beforeToolCall = async ({ toolCall, args }) => {
       const outside = blockOutsideProject(ctx, toolCall.name, args);
       if (outside) return outside;
-      return blockOutsideWriteRoots(ctx, toolCall.name, args, writeRoots) ?? undefined;
+      return blockOutsideWriteRoots(ctx, toolCall.name, args, writeRoots) ?? researchReview.before(toolCall.name, args) ?? undefined;
+    };
+
+    const afterToolCall = session.agent.afterToolCall;
+    session.agent.afterToolCall = async (context, signal) => {
+      // Shared skills may be read from outside the project. Their instructions
+      // do not establish project evidence or an editable file baseline.
+      const externalRead = context.toolCall.name === "read" && typeof context.args?.path === "string"
+        && !path.resolve(ctx.root, context.args.path).startsWith(path.resolve(ctx.root) + path.sep);
+      const review = externalRead ? undefined : researchReview.record(context);
+      if (!review) return afterToolCall?.(context, signal);
+      const result = { ...context.result, ...review };
+      const normalized = await afterToolCall?.({ ...context, result, isError: review.isError ?? context.isError }, signal);
+      return { ...review, ...normalized };
     };
 
     if (!config.fakeAgent && config.model) {
@@ -220,7 +269,7 @@ export function createSessionService({
     };
     if (restoredManager && !entry.automated) recoverInterruptedTurns(entry);
     entry.snapshot = () => serializeSession(entry);
-    attachSessionEvents(entry, { bus, onMaterialSaved, onRunSettled });
+    attachSessionEvents(entry, { bus, onMaterialSaved, onRunSettled, onRunStarted: researchReview.startRun });
     entry.agui = new PiAgUiAdapter({
       session,
       threadId: entry.id,

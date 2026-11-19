@@ -14,7 +14,7 @@ import { extractPresentation } from "../../lib/contracts/index.mjs";
 import { validCitations } from "../../lib/contracts/citation.mjs";
 import { resultText, toolDetail } from "./snapshot.mjs";
 
-export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, onRunSettled = () => {} }) {
+export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, onRunSettled = () => {}, onRunStarted = () => {} }) {
   function settle(aborted, record) {
     entry.updatedAt = record?.finishedAt || new Date().toISOString();
     entry.title = entry.session.sessionName || entry.title;
@@ -36,6 +36,7 @@ export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, on
     switch (event.type) {
       case "agent_start":
         if (turnId && entry.localRunId === turnId) break;
+        onRunStarted(entry);
         entry.localRunId = turnId || newRunId();
         entry.traceChangedFiles = [];
         entry.traceRunStartedAt = new Date().toISOString();
@@ -64,6 +65,7 @@ export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, on
         });
         break;
       case "tool_execution_end": {
+        const failed = Boolean(event.isError || event.result?.isError);
         const args = entry.toolArgs.get(event.toolCallId) || {};
         entry.toolArgs.delete(event.toolCallId);
         const extracted = extractPresentation(event.result);
@@ -128,15 +130,15 @@ export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, on
           type: "tool.completed",
           id: event.toolCallId,
           name: event.toolName,
-          status: event.isError ? "error" : "done",
+          status: failed ? "error" : "done",
           detail: toolDetail(entry.ctx, event.toolName, args),
           output: toolDisplayOutput(event.toolName, event.result, resultText(event.result)),
           ...(citations.length ? { citations } : {}),
           ...(presentation ? { presentation } : {}),
           ...(presentationError ? { presentationError } : {}),
         });
-        onMaterialSaved(entry, event.toolName, args);
-        if (["write", "edit"].includes(event.toolName) && typeof args.path === "string") {
+        if (!failed) onMaterialSaved(entry, event.toolName, args);
+        if (!failed && ["write", "edit"].includes(event.toolName) && typeof args.path === "string") {
           const root = path.resolve(entry.ctx.root);
           const absolute = path.resolve(root, args.path);
           if (absolute.startsWith(root + path.sep)) {

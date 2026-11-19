@@ -29,7 +29,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-PARSER_VERSION = 3
+PARSER_VERSION = 12
 
 try:
     import openpyxl
@@ -87,7 +87,9 @@ def safe_value(value: Any) -> Any:
 
 
 def is_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip()) and not value.lstrip().startswith("=")
+    return (isinstance(value, str) and bool(value.strip())
+            and not value.lstrip().startswith(("=", "#"))
+            and value.strip().lower() not in {"na", "n/a", "-"})
 
 
 def sha256_file(path: Path) -> str:
@@ -244,43 +246,102 @@ def build_labels(
     return row_labels, col_labels
 
 
-def nearest_text(
-    display: dict[tuple[int, int], Any],
-    formulas: dict[tuple[int, int], str],
-    row: int,
-    col: int,
-    label_cols: list[int],
-    col_labels: dict[int, str],
-) -> tuple[str | None, str | None]:
-    """Row label: nearest text to the left (prefer label columns).
-    Column label: precomputed header, else nearest label-like value above."""
-    row_label = None
-    candidates = [c for c in label_cols if c < col]
-    candidates += [c for c in range(col - 1, max(0, col - 9), -1) if c not in candidates]
-    for c in candidates:
-        value = display.get((row, c))
-        if is_text(value):
-            text = str(value).strip()
-            if len(text) <= 80 and "\n" not in text:
-                row_label = text
-                break
+PERIOD_TOKEN = r"(?:(?:[1-4]Q|[12]H|FY)\s*\d{2,4}|(?:19|20)\d{2})(?:[AE])?"
+BASIS_SUFFIX = r"(?:\s*(?:actuals?|forecast|assumption|实际|预测|假设)(?:\s*[;；|]\s*(?:scenario|情景)\s*[:：]\s*[^;；|\n]+)?)?"
+PERIOD_LABEL = rf"({PERIOD_TOKEN})(?:年度?)?"
+PERIOD_HEADER = re.compile(rf"{PERIOD_LABEL}{BASIS_SUFFIX}", re.I)
+LOCAL_PERIOD_HEADER = re.compile(rf"{PERIOD_LABEL}(?:{BASIS_SUFFIX}|\s+(?:P/E|PE|NI|Revenue|EPS).*)", re.I)
 
-    col_label = col_labels.get(col)
-    if col_label is None:
-        for r in range(row - 1, max(0, row - 9), -1):
-            value = display.get((r, col))
-            if value is None:
-                continue
-            if label_like(value):
-                text = str(safe_value(value)).strip()
-                if len(text) <= 60 and "\n" not in text:
-                    col_label = text
-                    break
-            if (r, col) in formulas:
-                continue
-            break
 
-    return row_label, col_label
+def period_headers(display, max_row, max_col):
+    """Use a band of neighboring date headers, keeping each original qualifier."""
+    headers = {}
+    for row in range(1, min(max_row, 9) + 1):
+        band = {}
+        for col in range(1, max_col + 1):
+            raw = str(display.get((row, col), "")).strip()
+            match = PERIOD_HEADER.fullmatch(raw)
+            if match:
+                band[col] = (row, match.group(1), raw)
+        for col, value in band.items():
+            if col - 1 in band or col + 1 in band:
+                headers[col] = value
+    return headers
+
+
+def local_column_header(display, row, col):
+    """Find the nearest column heading applicable to this row's block."""
+    contiguous = True
+    for r in range(row - 1, 0, -1):
+        value = display.get((r, col))
+        if value is None:
+            contiguous = False
+            continue
+        raw = str(value).strip()
+        match = LOCAL_PERIOD_HEADER.fullmatch(raw)
+        if match:
+            neighbors = [c for c in (col - 1, col + 1)
+                         if LOCAL_PERIOD_HEADER.fullmatch(str(display.get((r, c), "")).strip())]
+            if neighbors:
+                # Even after blank padding, parallel values belong to this band.
+                # An isolated scalar below it needs an explicit period of its own.
+                if r == row - 1 or any((row, c) in display for c in neighbors):
+                    return r, match.group(1), raw
+                return None
+            if contiguous and (is_text(value) or r == 1 or r == row - 1):
+                if PERIOD_HEADER.fullmatch(raw):
+                    return r, match.group(1), raw
+        if is_text(value) or isinstance(value, dt.date):
+            # An ordinary heading (e.g. AVG or opening quantity) starts a new
+            # block in this column even if an older header carried a year.
+            if contiguous and label_like(value):
+                return r, None, str(safe_value(value)).strip()
+            return None
+        contiguous = contiguous and (type(value) in (int, float) or raw.startswith("="))
+    return None
+
+
+def cell_column_info(display, row, col, row_label):
+    header = local_column_header(display, row, col)
+    period, label = header[1:] if header else (None, None)
+    if header and header[0] == row - 1 and period:
+        return label, period
+    # Scalar outputs can carry their own year (e.g. discounted back to 2027).
+    years = re.findall(r"\b(?:19|20)\d{2}[AE]?\b", row_label or "")
+    return label, years[0] if len(years) == 1 else period
+
+
+def scoped_row_labels(display, col_labels):
+    """Associate each occupied cell with a label in its own horizontal run.
+
+    Valuation sheets often have a label, a distant first value, then a
+    separate calculation across a blank gutter. A gap before the *first*
+    value is ordinary label padding. A gap after data can start a new block.
+    Keep sparse time series together when both columns have period headers.
+    """
+    sources = {}
+    previous_row = previous_col = None
+    for (row, col), value in sorted(display.items()):
+        if row != previous_row:
+            source = None
+            seen_data = False
+        elif seen_data and col - previous_col > 2:
+            periods_continue = all(
+                PERIOD_HEADER.fullmatch(str(col_labels.get(c, "")))
+                for c in (previous_col, col)
+            )
+            if not periods_continue:
+                source = None
+                seen_data = False
+        if source is not None:
+            sources[(row, col)] = source
+        if is_text(value) and len(value.strip()) <= 80 and "\n" not in value:
+            source = (value.strip(), f"{get_column_letter(col)}{row}")
+            seen_data = False
+        else:
+            seen_data = True
+        previous_row, previous_col = row, col
+    return sources
 
 
 def dedupe_warnings(messages: list[str], limit: int = 20) -> list[str]:
@@ -297,12 +358,76 @@ def dedupe_warnings(messages: list[str], limit: int = 20) -> list[str]:
     return result
 
 
+
+def chart_evidence(ws, values_ws):
+    """Keep chart references and reproduce linear fits from numeric cached pairs."""
+    charts = []
+    def title_text(axis):
+        rich = getattr(getattr(getattr(axis, "title", None), "tx", None), "rich", None)
+        return "".join(run.t for para in getattr(rich, "p", []) for run in getattr(para, "r", []) if run.t)
+    for index, chart in enumerate(getattr(ws, "_charts", [])):
+        for number, series in enumerate(chart.series):
+            xref = getattr(getattr(getattr(series, "xVal", None), "numRef", None), "f", None)
+            yref = getattr(getattr(getattr(series, "yVal", None), "numRef", None), "f", None)
+            trend = getattr(getattr(series, "trendline", None), "trendlineType", None)
+            item = {"sheet": ws.title, "chart": index + 1, "series": number + 1,
+                    "xRange": xref, "yRange": yref, "trendline": trend,
+                    "xTitle": title_text(getattr(chart, "x_axis", None)),
+                    "yTitle": title_text(getattr(chart, "y_axis", None))}
+            if xref and yref and values_ws is not None:
+                def read_range(ref):
+                    sheet, coord = ref.rsplit("!", 1)
+                    sheet = sheet.strip("'").replace("''", "'")
+                    target = values_ws.parent[sheet]
+                    return [(c.coordinate, c.value) for row in target[coord] for c in row]
+                try:
+                    xs, ys = read_range(xref), read_range(yref)
+                    pairs = [{"xRef": xref.rsplit("!", 1)[0] + "!" + x[0],
+                              "yRef": yref.rsplit("!", 1)[0] + "!" + y[0], "x": x[1], "y": y[1]}
+                             for x, y in zip(xs, ys) if isinstance(x[1], (int, float))
+                             and isinstance(y[1], (int, float)) and not isinstance(x[1], bool)
+                             and not isinstance(y[1], bool)]
+                    item["points"] = pairs
+                    if trend == "linear" and len(pairs) >= 2 and getattr(series.trendline, "intercept", None) is None:
+                        mx = sum(p["x"] for p in pairs) / len(pairs)
+                        my = sum(p["y"] for p in pairs) / len(pairs)
+                        xx = sum((p["x"] - mx) ** 2 for p in pairs)
+                        if xx:
+                            slope = sum((p["x"] - mx) * (p["y"] - my) for p in pairs) / xx
+                            intercept = my - slope * mx
+                            yy = sum((p["y"] - my) ** 2 for p in pairs)
+                            residual = sum((p["y"] - (slope * p["x"] + intercept)) ** 2 for p in pairs)
+                            item["fit"] = {"slope": slope, "intercept": intercept,
+                                           "rSquared": 1 - residual / yy if yy else None,
+                                           "n": len(pairs), "basis": "numeric cached chart points"}
+                            item["leaveOneOut"] = []
+                            if len(pairs) >= 3:
+                                for excluded in pairs:
+                                    sample = [point for point in pairs if point is not excluded]
+                                    ax = sum(point["x"] for point in sample) / len(sample)
+                                    ay = sum(point["y"] for point in sample) / len(sample)
+                                    dx = sum((point["x"] - ax) ** 2 for point in sample)
+                                    if not dx:
+                                        continue
+                                    k = sum((point["x"] - ax) * (point["y"] - ay) for point in sample) / dx
+                                    b = ay - k * ax
+                                    total = sum((point["y"] - ay) ** 2 for point in sample)
+                                    err = sum((point["y"] - k * point["x"] - b) ** 2 for point in sample)
+                                    item["leaveOneOut"].append({"excluded": excluded["xRef"],
+                                        "slope": k, "intercept": b,
+                                        "rSquared": 1 - err / total if total else None, "n": len(sample)})
+
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    item["warning"] = "Chart ranges could not be fully resolved"
+            charts.append(item)
+    return charts
+
 def parse_sheet(
     ws: Any, values_ws: Any | None
 ) -> tuple[
     dict[str, Any],
     dict[tuple[int, int], Any],
-    tuple[dict[int, str], dict[int, str]],
+    tuple[dict[tuple[int, int], tuple[str, str]], dict[int, str], dict[int, tuple[int, str]]],
     dict[str, dict[str, Any]],
     dict[str, set[str]],
     set[str],
@@ -350,10 +475,11 @@ def parse_sheet(
     formulas: dict[str, dict[str, Any]] = {}
     formula_refs: dict[str, set[str]] = {}
     referenced: set[str] = set()
+    headers = period_headers(display, max_row, max_col)
+    sources = scoped_row_labels(display, {**col_labels, **{c: h[1] for c, h in headers.items()}})
     for (row, col), formula in sheet_formulas.items():
-        row_label, col_label = nearest_text(
-            display, sheet_formulas, row, col, label_cols, col_labels
-        )
+        row_label, label_coord = sources.get((row, col), (None, None))
+        col_label, period = cell_column_info(display, row, col, row_label)
         computed_value = computed.get((row, col))
         cid = cell_id(ws.title, row, col)
         refs = extract_refs(formula, ws.title)
@@ -367,6 +493,8 @@ def parse_sheet(
             "row": row,
             "col": col,
             "rowLabel": row_label,
+            "labelCoord": label_coord,
+            "period": period,
             "colLabel": col_label,
         }
 
@@ -374,8 +502,9 @@ def parse_sheet(
     for (row, col), value in display.items():
         if (row, col) in sheet_formulas or value is None:
             continue
-        row_label, col_label = nearest_text(display, sheet_formulas, row, col, label_cols, col_labels)
-        context_cells.append([cell_id(ws.title, row, col), None, safe_value(value), row, col, row_label, col_label])
+        row_label, label_coord = sources.get((row, col), (None, None))
+        col_label, period = cell_column_info(display, row, col, row_label)
+        context_cells.append([cell_id(ws.title, row, col), None, safe_value(value), row, col, row_label, col_label, label_coord, period])
 
     sheet = {
         "contextCells": context_cells,
@@ -385,11 +514,12 @@ def parse_sheet(
         "formulaCount": len(sheet_formulas),
         "rowLabels": {str(k): v for k, v in row_labels.items()},
         "colLabels": {str(k): v for k, v in col_labels.items()},
+        "charts": chart_evidence(ws, values_ws),
     }
     return (
         sheet,
         display,
-        (row_labels, col_labels),
+        (sources, col_labels, headers),
         formulas,
         formula_refs,
         referenced,
@@ -422,7 +552,7 @@ def parse_workbook(path: Path) -> dict[str, Any]:
     formula_refs: dict[str, set[str]] = {}
     referenced: set[str] = set()
     sheet_values: dict[str, dict[tuple[int, int], Any]] = {}
-    sheet_labels: dict[str, tuple[dict[int, str], dict[int, str]]] = {}
+    sheet_labels: dict[str, tuple[dict[tuple[int, int], tuple[str, str]], dict[int, str], dict[int, tuple[int, str]]]] = {}
 
     for ws in wb.worksheets:
         values_ws = None
@@ -473,6 +603,12 @@ def parse_workbook(path: Path) -> dict[str, Any]:
     # Referenced cells without a formula are input nodes. They may be
     # referenced by a sheet other than the one they live in, so resolve them
     # only after every sheet has been read.
+    for sheet, display in sheet_values.items():
+        for (row, col), value in display.items():
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and sheet_labels[sheet][2].get(col, (None,))[0] != row):
+                referenced.add(cell_id(sheet, row, col))
+
     for cid in sorted(referenced):
         if cid in formulas:
             continue
@@ -486,14 +622,18 @@ def parse_workbook(path: Path) -> dict[str, Any]:
         value = sheet_values[sheet].get((row, col))
         if value is None:
             continue
-        row_labels, col_labels = sheet_labels[sheet]
+        sources = sheet_labels[sheet][0]
+        row_label, label_coord = sources.get((row, col), (None, None))
+        col_label, period = cell_column_info(sheet_values[sheet], row, col, row_label)
         formulas[cid] = {
             "formula": None,
             "value": safe_value(value),
             "row": row,
             "col": col,
-            "rowLabel": row_labels.get(row),
-            "colLabel": col_labels.get(col),
+            "rowLabel": row_label,
+            "labelCoord": label_coord,
+            "colLabel": col_label,
+            "period": period,
         }
 
     # Emit formula cells first, then referenced input cells.
@@ -513,6 +653,8 @@ def parse_workbook(path: Path) -> dict[str, Any]:
                 info["col"],
                 info["rowLabel"],
                 info["colLabel"],
+                info["labelCoord"],
+                info["period"],
             ]
         )
 

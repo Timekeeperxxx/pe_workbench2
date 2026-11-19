@@ -1,45 +1,8 @@
 import { isWorkbookMetricName } from '../../lib/workbook-query.mjs';
 import { Lexer } from 'marked';
-import { citationLookup } from '../../lib/citations.mjs';
-import { citationFilenames, citationIdentity, citationQualifiers, extractLocatorMatches, LOCATOR_SOURCE, locatorKey, maskCitationIds, resolveLocatorToken } from '../../lib/citation-locator.mjs';
-
-// Keep exactly the source cells an explicit reference resolves to, including
-// a covered range and the UI's "Sheet!A1、A2" shorthand.
-const SHORTHAND_CELL = /\s*[、,，]\s*(`*)(\$?[a-z]{1,3}\$?\d{1,7})(?![\w!:])\1/iy;
-
-export function adoptedCitations(text, available) {
-  const lookup = citationLookup(available);
-  const used = new Map();
-  const adopt = cell => {
-    // Removing unused evidence must not make an ambiguous reference clickable
-    // on refresh. Preserve that ambiguity on the remaining cell.
-    const ambiguousQualifiers = citationQualifiers(cell).filter(source => lookup.isAmbiguous(locatorKey(cell.locator), source));
-    used.set(cell.id, ambiguousQualifiers.length ? { ...cell, ambiguousQualifiers } : cell);
-  };
-  const idSources = new Set();
-  const searchable = maskCitationIds(text, available, cell => { if (cell) idSources.add(cell); });
-  for (const match of extractLocatorMatches(searchable)) {
-    const cells = [];
-    const resolved = resolveLocatorToken(match.raw, { get(key, source) {
-      const cell = lookup.get(key, source);
-      if (cell) cells.push(cell);
-      return cell;
-    } });
-    if (!resolved?.citation) continue;
-    const source = citationIdentity(resolved.citation);
-    const sheet = resolved.locator.split('!')[0];
-    for (const cell of cells) if (citationIdentity(cell) === source && cell.locator.split('!')[0].toLowerCase() === sheet.toLowerCase()) adopt(cell);
-    const tail = text.slice(match.index + match.raw.length).replace(/^`+/, '');
-    const adjacentCell = new RegExp(SHORTHAND_CELL);
-    for (let next; (next = adjacentCell.exec(tail));) {
-      const coord = next[2];
-      const cell = lookup.get((sheet + '!' + coord.replaceAll('$', '')).toLowerCase(), source);
-      if (cell) adopt(cell);
-    }
-  }
-  for (const cell of idSources) if (!used.has(cell.id)) adopt(cell);
-  return [...used.values()];
-}
+import { adoptedCitations, citationLookup } from '../../lib/citations.mjs';
+import { citationFilenames, citationIdentity, extractLocatorMatches, LOCATOR_SOURCE, locatorKey, maskCitationIds, resolveLocatorToken } from '../../lib/citation-locator.mjs';
+export { adoptedCitations };
 
 // A search hit vouches for what an earlier answer cited. It supplies a
 // versioned link in a source report, never a fresh reading of that cell.

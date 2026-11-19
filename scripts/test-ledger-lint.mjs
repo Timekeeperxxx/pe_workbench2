@@ -19,3 +19,6 @@ assert.equal(lintLedgerAnswer('利润1,234.50 亿。',{corrections:[{claim:'利�
 
 assert.equal(lintLedgerAnswer('利润-7.3亿。',ledger).filter(f=>f.rule==='repeats_corrected_value').length,0);
 assert.equal(lintLedgerAnswer('期间为2026 H1。',ledger).filter(f=>f.rule==='repeats_corrected_value').length,1);
+for (const qualified of ['假设销量翻倍，收入为789亿元。', '未核验：收入为789亿元。', '收入为789亿元（未核验）。']) {
+  assert.deepEqual(lintLedgerAnswer(qualified, {facts:[]}, {question:'收入是多少？'}), [], qualified);
+}
