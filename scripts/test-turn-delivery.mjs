@@ -1508,6 +1508,27 @@ for filename, value in [('A.xlsx', 111), ('B.xlsx', 222)]:
     assert.deepEqual(assistant.tools.map(tool => tool.status), ["error", "done", "done"]);
     assert.deepEqual(await openedCells(assistant), [destination(a, 111), destination(b, 222)]);
   });
+  for (const question of ["2025年净利润是多少？", "请给出2025年净利润", "What was net income?"]) {
+    await t.test(`a revenue answer requires correction for ${question}`, async () => {
+      const revenue = "收入为 111，见 Model!B2。";
+      const corrected = "净利为 33，见 Model!B3。" + revenue;
+      const { record, entries } = await turn(question, [
+        query(a), { text: revenue }, query(a, "Model", "B3"), { text: corrected },
+      ]);
+      assert.ok(entries.some(e => e.customType === "pe_answer_correct"));
+      assert.equal(record.status, "completed");
+      assert.equal(record.text, corrected);
+    });
+  }
+  await t.test("an unrelated caveat permits a checked amount and triggers correction for an unsupported one", async () => {
+    const corrected = "其他假设未核验，营业收入为 111，见 Model!B2。";
+    const { record, entries } = await turn("收入是多少？", [
+      query(a), { text: "其他假设未核验，收入为 789 亿元。" }, { text: corrected },
+    ]);
+    assert.ok(entries.some(e => e.customType === "pe_answer_correct"));
+    assert.equal(record.status, "completed");
+    assert.equal(record.text, corrected);
+  });
   for (const question of ["收入和净利润各是多少？", "请分别给出收入和净利润", "列出收入和净利润"]) {
     for (const [transport, attachments] of [["legacy", []], ["legacy", [a.path]], ["agui", [a.path]]]) {
       await t.test(`missing profit: ${question} (${transport}, ${attachments.length ? "attached" : "unattached"})`, async () => {

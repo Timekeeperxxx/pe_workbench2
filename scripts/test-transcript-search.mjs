@@ -91,11 +91,11 @@ console.log('transcript search PASS');
   };
   const tool = createTranscriptSearchTool({ getMessages: () => [
     { role: 'user', content: '问题' },
-    { role: 'assistant', content: '<img src=x> 出处 Model!B2', citations: [citation] },
+    { role: 'assistant', content: '<img src=x> 出处 Model!B2', citations: [{ ...citation, formula: 'F'.repeat(13000) }] },
   ], getLedger: () => ({ topics: ['L'.repeat(13000)] }) });
   const result = await tool.execute('search', { query: '出处' });
-  // The model drops detailed citations at its own budget. The historical
-  // source in the process must survive even when its ledger fills the output.
+  // The model compacts citation fields at its budget. The process card
+  // still shows the original source when the model projection omits details.
   assert.equal(JSON.parse(result.content[0].text).citationDetailsOmitted, true);
   const output = toolDisplayOutput('transcript_search', result, result.content[0].text);
   assert.ok(output.length <= 4000);
@@ -109,5 +109,37 @@ console.log('transcript search PASS');
   const oldCard = renderToolPresentation({id: 'old', name: 'transcript_search', status: 'done', output: JSON.stringify(versionless)});
   assert.match(oldCard, /Model!B2/);
   assert.doesNotMatch(oldCard, /data-cell-cite/);
+}
 
+{
+  const history = [
+    { role: 'user', content: 'FY2024 收入' },
+    { role: 'assistant', content: 'FY2024 收入为 827.35 万元。' },
+  ];
+  for (const size of [3, 2100]) {
+    const ledger = {
+      sessionId: 'stable-fixture', claims: [], corrections: [],
+      facts: Array.from({ length: size }, (_, i) => ({ id: 'fact-' + i,
+        claim: '收入', period: 'FY2024', value: i + 1, unit: '万元', turn: 1 })),
+    };
+    const tool = createTranscriptSearchTool({ getMessages: () => history, getLedger: () => ledger });
+    const result = await tool.execute('miss', {query:'缺失指标'});
+    const projected = JSON.parse(result.content[0].text);
+    assert.equal(projected.ledger, undefined);
+    assert.deepEqual(projected.matches, []);
+    assert.deepEqual(projected.ledgerMatches, []);
+    assert.equal(projected.coverage.turnsScanned, 1);
+    assert.equal(projected.ledgerCoverage.factsScanned, size);
+    assert.equal(projected.ledgerSummary.facts, size);
+    assert.equal(projected.ledgerTotalMatches, 0);
+    assert.ok(result.content[0].text.length < 12000);
+    assert.equal(result.details.ledger, ledger);
+    const hit = await tool.execute('hit', {query:'收入', limit:50});
+    assert.ok(hit.content[0].text.length <= 12000);
+    const context = JSON.parse(hit.content[0].text);
+    assert.match(context.matches[1].excerpt, /827\.35/);
+    assert.ok(context.ledgerMatches.length);
+    assert.equal(context.ledgerTotalMatches, size);
+  }
+  console.log('transcript and ledger hit/miss coverage with growing fixtures PASS');
 }
