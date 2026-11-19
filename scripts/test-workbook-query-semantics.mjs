@@ -19,7 +19,14 @@ s=w.create_sheet('Money'); s.append(['收入','RMB mn','2025E']); s.append(['腾
 s=w.create_sheet('Annual'); s['B1']='2025年'; s.append(['收入',111,112]); s.append(['净利润',33]); s['A5']='独立数值'; s['B5']=14
 s['B6']='2026年度预测；情景：基准'; s['A7']='收入'; s['B7']=120; s['A8']='净利润'; s['B8']='=B7/3'
 s['B9']='另一组指标'; s['A10']='库存'; s['B10']=12
+s['B12']='2023年实际'; s['A13']='净利润'; s['B13']=30
 s=w.create_sheet('Annual band'); s.append(['指标','2024年实际','2025E forecast']); s.append(['收入',10,20]); s.append(['净利润',1,2])
+s['A5'],s['B5'],s['C5']='库存','期初数量','期末数量'; s.append(['原材料',19,28])
+s['A12'],s['B12'],s['C12']='指标','2022年度实际','2023年度预测；情景：基准'
+s.append(['净利润',11,12]); s.append(['收入',110,120])
+s=w.create_sheet('Plan'); s.append(['年度经营预测；情景：基准']); s.append(['科目','2026年','2027年','2024年实际'])
+s.append(['收入',10,11,8]); s.append(['净利润',2,3,1])
+s['A6'],s['B6']='科目','2023年'; s['A7'],s['B7']='收入',9
 s=w.create_sheet('Plain'); s['A1']='数值'; s['B1']=123; w.save(sys.argv[1])`,file],{encoding:'utf8'});
  assert.equal(made.status,0,made.stderr);
  const parser=fileURLToPath(new URL('../services/workbook/parse_workbook.py',import.meta.url));
@@ -50,12 +57,35 @@ s=w.create_sheet('Plain'); s['A1']='数值'; s['B1']=123; w.save(sys.argv[1])`,f
    const cell = annual('Annual!' + coord);
    assert.equal(cell.value, value); assert.equal(cell.period, '2025'); assert.equal(cell.header, '2025年');
  }
- for (const coord of ['C2','B5','B10']) assert.equal(annual('Annual!' + coord).period, null, coord);
+ for (const [ref, header] of [['Annual!C2',null], ['Annual!B5',null], ['Annual!B10','另一组指标'],
+   ['Annual band!B6','期初数量'], ['Annual band!C6','期末数量']]) {
+   const cell = annual(ref);
+   assert.equal(cell.header, header, ref); assert.equal(cell.period, null, ref);
+   assert.equal(cell.sourceContext.period, null, ref); assert.equal(cell.basis_type, 'unknown', ref);
+   assert.equal(cell.scenario, '', ref);
+ }
+ const nextActual = annual('Annual!B13');
+ assert.equal(nextActual.period, '2023'); assert.equal(nextActual.basis_type, 'actual'); assert.equal(nextActual.scenario, '');
+ for (const row of [13,14]) {
+   for (const [col, year, basis, scenario] of [['B','2022','actual',''], ['C','2023','forecast','基准']]) {
+     const ref = 'Annual band!' + col + row, cell = annual(ref);
+     assert.equal(cell.period, year, ref); assert.equal(cell.basis_type, basis, ref); assert.equal(cell.scenario, scenario, ref);
+   }
+ }
  const forecast = annual('Annual!B8');
  assert.equal(forecast.period, '2026'); assert.equal(forecast.basis_type, 'forecast'); assert.equal(forecast.scenario, '基准');
  const actual = annual('Annual band!B3');
  assert.equal(actual.period, '2024'); assert.equal(actual.basis_type, 'actual');
  assert.equal(annual('Annual band!C3').period, '2025E');
+ for (const ref of ['Plan!B3','Plan!C4']) {
+   const cell = annual(ref);
+   assert.equal(cell.basis_type, 'forecast', ref); assert.equal(cell.scenario, '基准', ref);
+ }
+ assert.equal(annual('Plan!D4').basis_type, 'actual');
+ assert.equal(annual('Plan!D4').scenario, '');
+ assert.equal(annual('Plan!B7').basis_type, 'unknown');
+ assert.equal(annual('Plan!B7').scenario, '');
+ assert.doesNotMatch(annual('Plan!B7').excerpt, /基准/);
  const plain=queryGraph(graph,'Plain!B1').cells.find(c=>c.ref==='Plain!B1');
  assert.equal(plain.display_unit,'unit_unknown');
  assert.equal(queryGraph(graph,'HBM',{maxCells:1}).coverage.truncated,true);

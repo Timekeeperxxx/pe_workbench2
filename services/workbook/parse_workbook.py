@@ -29,7 +29,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-PARSER_VERSION = 11
+PARSER_VERSION = 12
 
 try:
     import openpyxl
@@ -269,7 +269,8 @@ def period_headers(display, max_row, max_col):
     return headers
 
 
-def local_period_header(display, row, col, headers, *, allow_band=True):
+def local_column_header(display, row, col):
+    """Find the nearest column heading applicable to this row's block."""
     contiguous = True
     for r in range(row - 1, 0, -1):
         value = display.get((r, col))
@@ -278,34 +279,36 @@ def local_period_header(display, row, col, headers, *, allow_band=True):
             continue
         raw = str(value).strip()
         match = LOCAL_PERIOD_HEADER.fullmatch(raw)
-        if match or is_text(value):
-            if any(LOCAL_PERIOD_HEADER.fullmatch(str(display.get((r, other), "")).strip()) for other in (col-1, col+1)):
-                if allow_band:
-                    return r, match.group(1) if match else None, raw
+        if match:
+            neighbors = [c for c in (col - 1, col + 1)
+                         if LOCAL_PERIOD_HEADER.fullmatch(str(display.get((r, c), "")).strip())]
+            if neighbors:
+                # Even after blank padding, parallel values belong to this band.
+                # An isolated scalar below it needs an explicit period of its own.
+                if r == row - 1 or any((row, c) in display for c in neighbors):
+                    return r, match.group(1), raw
                 return None
-            if contiguous and is_text(value) and PERIOD_HEADER.fullmatch(raw):
-                return r, match.group(1), raw
-        # Only values and formulas join consecutive rows of a single-column table.
+            if contiguous and (is_text(value) or r == 1 or r == row - 1):
+                if PERIOD_HEADER.fullmatch(raw):
+                    return r, match.group(1), raw
+        if is_text(value) or isinstance(value, dt.date):
+            # An ordinary heading (e.g. AVG or opening quantity) starts a new
+            # block in this column even if an older header carried a year.
+            if contiguous and label_like(value):
+                return r, None, str(safe_value(value)).strip()
+            return None
         contiguous = contiguous and (type(value) in (int, float) or raw.startswith("="))
-    original = headers.get(col)
-    return original if allow_band and original and original[0] < row else None
+    return None
 
 
-def cell_period(display, headers, row, col, row_label):
-    # Main also supports a single value column immediately under a period label.
-    # Keep this local so scalar values do not inherit a distant table's period.
-    immediate = str(display.get((row - 1, col), "")).strip()
-    match = PERIOD_HEADER.fullmatch(immediate)
-    if match:
-        return match.group(1)
+def cell_column_info(display, row, col, row_label):
+    header = local_column_header(display, row, col)
+    period, label = header[1:] if header else (None, None)
+    if header and header[0] == row - 1 and period:
+        return label, period
     # Scalar outputs can carry their own year (e.g. discounted back to 2027).
     years = re.findall(r"\b(?:19|20)\d{2}[AE]?\b", row_label or "")
-    if len(years) == 1:
-        return years[0]
-    # A scalar below a multi-period band needs another populated period column.
-    in_band = any(adj in headers and (row, adj) in display for adj in (col-1, col+1))
-    local = local_period_header(display, row, col, headers, allow_band=in_band)
-    return local[1] if local else None
+    return label, years[0] if len(years) == 1 else period
 
 
 def scoped_row_labels(display, col_labels):
@@ -339,26 +342,6 @@ def scoped_row_labels(display, col_labels):
             seen_data = True
         previous_row, previous_col = row, col
     return sources
-
-
-def column_label(display, formulas, row, col, col_labels):
-    local = local_period_header(display, row, col, {})
-    col_label = local[2] if local else col_labels.get(col)
-    if col_label is None:
-        for r in range(row - 1, max(0, row - 9), -1):
-            value = display.get((r, col))
-            if value is None:
-                continue
-            if label_like(value):
-                text = str(safe_value(value)).strip()
-                if len(text) <= 60 and "\n" not in text:
-                    col_label = text
-                    break
-            if (r, col) in formulas:
-                continue
-            break
-
-    return col_label
 
 
 def dedupe_warnings(messages: list[str], limit: int = 20) -> list[str]:
@@ -496,7 +479,7 @@ def parse_sheet(
     sources = scoped_row_labels(display, {**col_labels, **{c: h[1] for c, h in headers.items()}})
     for (row, col), formula in sheet_formulas.items():
         row_label, label_coord = sources.get((row, col), (None, None))
-        col_label = column_label(display, sheet_formulas, row, col, col_labels)
+        col_label, period = cell_column_info(display, row, col, row_label)
         computed_value = computed.get((row, col))
         cid = cell_id(ws.title, row, col)
         refs = extract_refs(formula, ws.title)
@@ -511,7 +494,7 @@ def parse_sheet(
             "col": col,
             "rowLabel": row_label,
             "labelCoord": label_coord,
-            "period": cell_period(display, headers, row, col, row_label),
+            "period": period,
             "colLabel": col_label,
         }
 
@@ -520,8 +503,8 @@ def parse_sheet(
         if (row, col) in sheet_formulas or value is None:
             continue
         row_label, label_coord = sources.get((row, col), (None, None))
-        col_label = column_label(display, sheet_formulas, row, col, col_labels)
-        context_cells.append([cell_id(ws.title, row, col), None, safe_value(value), row, col, row_label, col_label, label_coord, cell_period(display, headers, row, col, row_label)])
+        col_label, period = cell_column_info(display, row, col, row_label)
+        context_cells.append([cell_id(ws.title, row, col), None, safe_value(value), row, col, row_label, col_label, label_coord, period])
 
     sheet = {
         "contextCells": context_cells,
@@ -639,8 +622,9 @@ def parse_workbook(path: Path) -> dict[str, Any]:
         value = sheet_values[sheet].get((row, col))
         if value is None:
             continue
-        sources, col_labels, headers = sheet_labels[sheet]
+        sources = sheet_labels[sheet][0]
         row_label, label_coord = sources.get((row, col), (None, None))
+        col_label, period = cell_column_info(sheet_values[sheet], row, col, row_label)
         formulas[cid] = {
             "formula": None,
             "value": safe_value(value),
@@ -648,8 +632,8 @@ def parse_workbook(path: Path) -> dict[str, Any]:
             "col": col,
             "rowLabel": row_label,
             "labelCoord": label_coord,
-            "colLabel": column_label(sheet_values[sheet], {}, row, col, col_labels),
-            "period": cell_period(sheet_values[sheet], headers, row, col, row_label),
+            "colLabel": col_label,
+            "period": period,
         }
 
     # Emit formula cells first, then referenced input cells.
