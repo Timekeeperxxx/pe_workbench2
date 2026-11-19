@@ -7,6 +7,17 @@ import { linkCitations } from "../ui/chat/cell-citations.js";
 import { snapshotMessages } from "../server/agent/snapshot.mjs";
 import { adoptedCitations } from "../server/agent/answer-delivery.mjs";
 
+{
+  const cell = { id: 'cite:m:v1:Model!B2', materialId: 'm', filename: 'Book.xlsx', version: 1, locator: 'Model!B2' };
+  const report = '[Book.xlsx]Model!B2，引用 ID：<code>' + cell.id + '</code>。';
+  const html = linkCitations(report, [cell]);
+  assert.equal((html.match(/data-cell-cite/g) || []).length, 1);
+  assert.ok(html.includes('<code>' + cell.id + '</code>'));
+  // Preserve the clickable source of an older message containing only the ID.
+  assert.deepEqual(adoptedCitations(cell.id, [cell]), [cell]);
+  assert.match(linkCitations(cell.id, [cell]), /data-locator="Model!B2"/);
+}
+
 /* S1: the browser linkifier may only import files the static server exposes
  * under /ui. `/lib` is deliberately not a static root, so a `../../lib/...`
  * import 404s in the browser and breaks the whole chat bootstrap. */

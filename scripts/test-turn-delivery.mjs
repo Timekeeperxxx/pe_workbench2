@@ -11,6 +11,7 @@ import { test } from "node:test";
 import vm from "node:vm";
 import { Type } from "typebox";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { citationIdFor } from "../lib/citations.mjs";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { loadConfig, REPO_ROOT } from "../server/config.mjs";
 import { createWorkbench } from "../server/create-app.mjs";
@@ -422,13 +423,18 @@ sys.stdout.buffer.write(data.getvalue())
     manager.appendCustomMessageEntry("pe_answer_correct", internal, false);
     answer(original);
     manager.appendCustomEntry("pe_answer_lint", { citations: [{
-      id: "legacy-cell", materialId: book.material.id, version: 1, filename, locator: "Model!B2", value: 317,
+      id: citationIdFor(book.material.id, 1, "Model!B2"), materialId: book.material.id, version: 1, filename, locator: "Model!B2", value: 317,
     }] });
     return manager.getSessionId();
   }
 
   async function openOriginalCell(page, body, materialId) {
-    await body.locator("[data-cell-cite]").click();
+    const links = body.locator("[data-cell-cite]");
+    const targets = await links.evaluateAll(nodes => nodes.map(({ dataset }) =>
+      [dataset.materialId, dataset.version, dataset.locator]));
+    assert.ok(targets.length > 0);
+    for (const target of targets) assert.deepEqual(target, [materialId, "1", "Model!B2"]);
+    await body.getByRole("button", { name: `[${filename}]Model!B2`, exact: true }).click();
     const cell = page.locator('#xlsxSheet .xlsx-c.is-sel[data-r="2"][data-c="2"]');
     await cell.waitFor();
     assert.equal(await cell.innerText(), "317");
@@ -444,6 +450,7 @@ sys.stdout.buffer.write(data.getvalue())
     assert.deepEqual(copies.map(publicAnswer), [publicAnswer(record)]);
     const body = answers(ui.page).nth(index).locator(".msg-body");
     if (record.status === "completed") assert.equal(await body.innerText(), record.text);
+    else if (record.text) assert.ok((await body.innerText()).includes(record.text));
     else assert.equal(await body.locator("[data-cell-cite]").count(), 0);
     return body;
   }
@@ -513,8 +520,10 @@ sys.stdout.buffer.write(data.getvalue())
         const changed = ctx.store.indexFile(book.path);
         assert.equal(changed.id, book.material.id);
         assert.equal(changed.versions[0].v, 2);
-        const grid = await json(`/api/materials/${book.material.id}/versions/2/workbook/sheets/Model`);
-        assert.equal(grid.cells.find(([r, c]) => r === 2 && c === 2)[2], 942);
+        for (const [version, value] of [[1, 317], [2, 942]]) {
+          const grid = await json(`/api/materials/${book.material.id}/versions/${version}/workbook/sheets/Model`);
+          assert.equal(grid.cells.find(([r, c]) => r === 2 && c === 2)[2], value);
+        }
         await ui.reload(id);
         await ui.page.waitForFunction(id => state.files.some(f =>
           f.id === id && f.versions.some(version => version.v === 2)), book.material.id);
@@ -580,9 +589,26 @@ sys.stdout.buffer.write(data.getvalue())
         }
 
         const question = "请用 transcript_search 查第1轮正式回答。请说明当时引用了哪个单元格，有材料版本时可以注明，只报告历史出处。";
-        for (const [variant, suffix] of ["", "（材料版本 v1）", "（材料版本 v2）"].entries()) {
-          await t.test(`reported source ${suffix || "without version"}`, async t => {
-            const text = `已交付回答引用的单元格是 [${filename}]Model!B2${suffix}。`;
+        const source = `已交付回答引用的单元格是 [${filename}]Model!B2`;
+        const citationId = match.citations[0].id;
+        const wrongId = citationId.replace(":v1:", ":v2:");
+        assert.notEqual(citationId, wrongId);
+        const cases = [
+          { ending: "。" },
+          { ending: "（材料版本 v1）。", inspect: true },
+          { ending: "（材料版本 v2）。", reject: true },
+          { ending: `（材料版本 v1，引用 ID：${citationId}）。`, inspect: true },
+          { ending: `（材料版本 v1，引用 ID：${wrongId}）。`, invalid: wrongId },
+          { ending: "。当时用的是第一版。", inspect: true },
+          { ending: "。当时用的是第二版。", invalid: "第二版" },
+          { ending: "（材料第二版）。", reject: true },
+          { ending: "。材料版本为 v2。", invalid: "v2" },
+        ];
+        const coldReplies = [];
+        coldCases.push({ transport, history, id, materialId: book.material.id, coldReplies });
+        for (const [variant, { ending, inspect, reject, invalid }] of cases.entries()) {
+          await t.test(`reported source ${ending === "。" ? "without version" : ending}`, async t => {
+            const text = source + ending;
             const start = branch().length;
             const model = scriptModel(entry, [
               { toolId: `version-${variant}`, toolName: "transcript_search", tool: { query: queries[0], turn: 1 }, stopReason: "toolUse" },
@@ -597,7 +623,7 @@ sys.stdout.buffer.write(data.getvalue())
             // Keep the sender connected for live delivery. A second browser loses
             // its connection with the answer still pending.
             let peer;
-            if (variant === 1) {
+            if (inspect) {
               peer = await open(t, transport);
               await peer.select(id);
               await peer.page.waitForFunction(() => state.streaming && Boolean(state.live.turnId));
@@ -607,17 +633,24 @@ sys.stdout.buffer.write(data.getvalue())
             const delivered = await bounded(pending, "version follow-up did not settle");
             if (peer) await peer.context.setOffline(false);
             const index = variant + 2;
-            const expected = variant === 2 ? ["failed", "", []] : ["completed", text, first.citations];
-            if (peer) {
-              coldCases.push({ transport, history, id, materialId: book.material.id, index,
-                expected: { turnId: delivered.turnId, status: "completed", text, citations: first.citations } });
+            if (invalid) {
+              assert.ok(!delivered.text.includes(invalid), `unverified source was delivered: ${delivered.text}`);
             }
-            assert.deepEqual([delivered.status, delivered.text, delivered.citations], expected);
+            if (reject || (invalid && delivered.status === "failed")) {
+              assert.deepEqual([delivered.status, delivered.text, delivered.citations], ["failed", "", []]);
+            } else if (invalid) {
+              assert.ok(["partial", "completed"].includes(delivered.status));
+              assert.equal(delivered.text, source + "。");
+              assert.deepEqual(delivered.citations, first.citations);
+            } else {
+              assert.deepEqual([delivered.status, delivered.text, delivered.citations], ["completed", text, first.citations]);
+            }
+            if (inspect || invalid) coldReplies.push({ index, record: delivered });
             assert.deepEqual(branch().slice(start).filter(e => e.customType === "pe_turn_delivery").map(e => e.data), [delivered]);
             assert.deepEqual(publicAnswer((await snapshot())[index]), publicAnswer(delivered));
             await checkReply(ui, delivered, index);
             if (peer) {
-              await checkReply(peer, delivered, index);
+              await openOriginalCell(peer.page, await checkReply(peer, delivered, index), book.material.id);
               await ui.reload(id);
               const body = await checkReply(ui, delivered, index);
               await openOriginalCell(ui.page, body, book.material.id);
@@ -629,12 +662,15 @@ sys.stdout.buffer.write(data.getvalue())
   }
   return async function checkRestartedHistory(t, origin) {
     assert.equal(coldCases.length, 4);
-    for (const { transport, history, id, materialId, expected, index } of coldCases) {
+    for (const { transport, history, id, materialId, coldReplies } of coldCases) {
       await t.test(`Chrome ${transport} ${history}: exact versioned source after process restart`, async t => {
         const ui = await open(t, transport, origin);
         await ui.select(id);
-        const body = await checkReply(ui, expected, index);
-        await openOriginalCell(ui.page, body, materialId);
+        assert.equal(coldReplies.length, 6);
+        for (const { record, index } of coldReplies) {
+          const body = await checkReply(ui, record, index);
+          if (record.status === "completed") await openOriginalCell(ui.page, body, materialId);
+        }
       });
     }
   };

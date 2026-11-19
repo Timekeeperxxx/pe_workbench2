@@ -534,6 +534,48 @@ console.log('target deviation post-answer correction passed');
     }
 
     const sourceReport = '已交付回答引用的单元格是 [Acceptance13.xlsx]Model!B2';
+    // Field values are opaque IDs returned by this search, including IDs from older tools.
+    const canonicalId = 'cite:' + liveSource.materialId + ':v1:Model!B2';
+    const another = { ...liveSource, id: 'cite:second:v1:Model!B2', materialId: 'second', filename: 'Other.xlsx' };
+    for (const id of [canonicalId, 'legacy-source-93']) {
+      const cited = { ...liveSource, id };
+      const matches = { matches: [{ ...hit, citations: [cited, another] }] };
+      const phrase = sourceReport + '（材料版本 v1，引用 ID：' + id + '）。';
+      const { record } = await runScript([{ search: matches, text: phrase }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', phrase, [{ ...cited, ambiguousQualifiers: [''] }]]);
+      for (const wrong of [another.id, canonicalId.replace(':v1:', ':v2:'), canonicalId.replace('!B2', '!B3'), id + 'extra', id + '.v1']) {
+        const text = phrase.replace('引用 ID：' + id, '引用 ID：' + wrong);
+        const { record } = await runScript([{ search: matches, text }, { text }], sourceQuestion);
+        assert.deepEqual([record.status, record.text, record.citations], ['failed', '', []], text);
+      }
+    }
+    const returned = { ...liveSource, id: canonicalId };
+    const idSearch = { matches: [{ ...hit, citations: [returned] }] };
+    const providerReports = [
+      `在第1轮回答中，所引用的出处是工作簿文件 Acceptance13.xlsx，材料 ID 为 ${liveSource.materialId}、版本为 v1，单元格为 Model!B2；按引用格式写作 [Acceptance13.xlsx]Model!B2（引用 ID：cite:${liveSource.materialId}:v1:Model!B2）。`,
+      `第1轮回答中引用的出处是工作簿 Acceptance13.xlsx（材料 ID ${liveSource.materialId}、版本 v1）的 [Acceptance13.xlsx]Model!B2，引用 ID 为 cite:${liveSource.materialId}:v1:Model!B2。`,
+      `第 1 轮中的回答引用了工作簿 Acceptance13.xlsx，材料版本为 v1（材料 ID：${liveSource.materialId}），单元格是 Model!B2，也就是 Sheet 为 Model 的 B2 单元格；对应的完整引用 ID 是 cite:${liveSource.materialId}:v1:Model!B2。`,
+      `第 1 轮回答引用的工作簿是 [Acceptance13.xlsx]（材料 ID ${liveSource.materialId}，版本 v1），单元格为 Model!B2，完整引用 ID 是 cite:${liveSource.materialId}:v1:Model!B2。`,
+      `第1轮回答引用的内容包括：工作簿为 Acceptance13.xlsx，材料 ID 为 ${liveSource.materialId}，版本为 v1；单元格为 Model!B2；完整引用 ID 为 cite:${liveSource.materialId}:v1:Model!B2。`,
+      `第1轮回答引用的出处是 [Acceptance13.xlsx@v1]Model!B2，对应的材料 ID 是 ${liveSource.materialId}，版本为 v1，完整引用 ID 是 cite:${liveSource.materialId}:v1:Model!B2。`,
+    ];
+    for (const text of providerReports) {
+      const { record } = await runScript([{ search: idSearch, text }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [returned]]);
+    }
+    const wrongSheet = providerReports[2].replace('Sheet 为 Model 的 B2', 'Sheet 为 Other 的 B2');
+    const wrongReport = await runScript([{ search: idSearch, text: wrongSheet }, { text: wrongSheet }], sourceQuestion);
+    assert.equal(wrongReport.record.status, 'failed');
+    for (const [note, expected] of [['当时用的是第一版。', 'completed'], ['当时用的是第二版。', 'partial'], ['当时用的是第二版，现在文件已更新。', 'partial']]) {
+      const sourced = sourceReport + '。';
+      const text = sourced + note;
+      const steps = [{ search: liveSearch, text }];
+      if (expected === 'partial') steps.push({ text });
+      const { record } = await runScript(steps, sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations],
+        [expected, expected === 'completed' ? text : sourced, [liveSource]]);
+    }
+
     const sourceOnly = '第 1 轮已交付回答引用的出处为：工作簿 Acceptance13.xlsx（材料 ID 为 '
       + liveSource.materialId + '，材料版本 v1），对应单元格 Model!B2；该回答中的引用写作 ['
       + liveSource.materialId + '@v1]Model!B2。';
@@ -604,6 +646,14 @@ console.log('target deviation post-answer correction passed');
     const mixedNote = await runScript([{ search: liveSearch, text: financialNote }, { text: financialNote }], sourceQuestion);
     assert.deepEqual([mixedNote.record.status, mixedNote.record.text, mixedNote.record.citations],
       ['partial', sourceReport + '（材料版本 v1）。', [liveSource]]);
+    const direct = { ...liveSource, id: 'cite:' + liveSource.materialId + ':v2:Model!B2', version: 2, value: 942 };
+    const directNote = '本轮直接读取的数值为 942，依据 [' + liveSource.materialId + '@v2]Model!B2（引用 ID：' + direct.id + '）。';
+    const both = '第一轮正式回答引用的是 [' + liveSource.materialId + '@v1]Model!B2。' + directNote;
+    const combined = await runScript([
+      { citations: [direct], text: '出处是 Missing!A9。' }, { search: idSearch, text: both },
+    ], sourceQuestion);
+    assert.equal(combined.record.status, 'completed');
+    assert.deepEqual(combined.record.citations.map(cell => cell.id), [canonicalId, direct.id]);
     const withGap = appendedVersion + '\n\n未核验：说话时该文件在项目中的实际存放路径及磁盘上的版本副本。';
     const withGapResult = await runScript([{ search: liveSearch, text: withGap }], sourceQuestion);
     assert.deepEqual([withGapResult.record.status, withGapResult.record.text, withGapResult.record.citations],

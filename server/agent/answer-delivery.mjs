@@ -1,7 +1,7 @@
 import { isWorkbookMetricName } from '../../lib/workbook-query.mjs';
 import { Lexer } from 'marked';
 import { citationLookup } from '../../lib/citations.mjs';
-import { citationIdentity, citationQualifiers, extractLocatorMatches, LOCATOR_SOURCE, locatorKey, resolveLocatorToken } from '../../lib/citation-locator.mjs';
+import { citationIdentity, citationQualifiers, extractLocatorMatches, LOCATOR_SOURCE, locatorKey, maskCitationIds, resolveLocatorToken } from '../../lib/citation-locator.mjs';
 
 // Keep exactly the source cells an explicit reference resolves to, including
 // a covered range and the UI's "Sheet!A1、A2" shorthand.
@@ -16,7 +16,9 @@ export function adoptedCitations(text, available) {
     const ambiguousQualifiers = citationQualifiers(cell).filter(source => lookup.isAmbiguous(locatorKey(cell.locator), source));
     used.set(cell.id, ambiguousQualifiers.length ? { ...cell, ambiguousQualifiers } : cell);
   };
-  for (const match of extractLocatorMatches(text)) {
+  const idSources = new Set();
+  const searchable = maskCitationIds(text, available, cell => { if (cell) idSources.add(cell); });
+  for (const match of extractLocatorMatches(searchable)) {
     const cells = [];
     const resolved = resolveLocatorToken(match.raw, { get(key, source) {
       const cell = lookup.get(key, source);
@@ -35,6 +37,7 @@ export function adoptedCitations(text, available) {
       if (cell) adopt(cell);
     }
   }
+  for (const cell of idSources) if (!used.has(cell.id)) adopt(cell);
   return [...used.values()];
 }
 
@@ -55,17 +58,30 @@ const SOURCE_VERSION = new RegExp(String.raw`(?:(?:材料|文件)(?:的)?\s*)?(?
 
 // Check descriptive fields against the source of the written locator. Keep the
 // original answer and its qualifiers intact for lint, delivery and linking.
-function checkSourceFields(clause, refs, lookup, precedingSource) {
+function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
   const resolved = refs.map(ref => resolveLocatorToken(ref.raw, lookup)?.citation);
   let conflict = '';
   let hasFields = false;
+  let idConflict = '';
+  let hasId = false;
   function check(segment, source) {
-    let text = segment.normalize('NFKC').replace(/^\s*[-•]\s+/, '').replace(/[`*]/g, '');
+    // Compare to the literal ID of the written source, not a reconstructed
+    // ID or a different citation that happened to match the search.
+    let text = maskCitationIds(segment, ids, (cited, field) => {
+      hasId = true;
+      hasFields = true;
+      if (!cited || cited.id !== source?.id) idConflict = field;
+    }).normalize('NFKC').replace(/^\s*[-•]\s+/, '').replace(/[`*]/g, '');
     if (source?.filename) {
       const filename = source.filename.normalize('NFKC').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const nameField = String.raw`(?:(?:工作簿|文件)(?:名(?:称)?)?\s*(?:为|是|:)?\s*)?`;
-      text = text.replace(new RegExp(nameField + String.raw`(?<![\w.-])` + filename, 'g'), ' ');
+      text = text.replace(new RegExp(nameField + String.raw`(?:\[${filename}\]|(?<![\w.-])${filename})`, 'g'), ' ');
     }
+    text = text.replace(/(?:\bSheet|工作表)\s*(?:为|是|:)\s*([^，,;；()]+?)\s*的\s*(\$?[a-z]{1,3}\$?\d+)\s*单元格/gi, (field, sheet, cell) => {
+      hasFields = true;
+      if (!source || locatorKey(sheet.trim() + '!' + cell) !== locatorKey(source.locator)) conflict = field;
+      return ' ';
+    });
     const otherWorkbook = text.match(/[^\s()[\]，,。；;]+\.xls[xm]\b/i);
     if (otherWorkbook) conflict = otherWorkbook[0];
     text = text.replace(/(?:材料|文件|material|file)\s*ID\s*(?:为|是|[:=])?\s*([\w-]+)/gi, (field, id) => {
@@ -101,15 +117,15 @@ function checkSourceFields(clause, refs, lookup, precedingSource) {
   }
   const lastSource = refs.length ? resolved.at(-1) : precedingSource;
   checked += check(clause.slice(end), lastSource);
-  return { checked, conflict, hasFields, lastSource };
+  return { checked, conflict, idConflict, hasId, hasFields, lastSource };
 }
 
 // A source-only answer can list fields, or give several spellings of one
 // locator. Consume only provenance vocabulary after checking field values. Any
 // remaining assertion still needs the usual direct evidence and lint checks.
 const SOURCE_WORDS = new RegExp([
-  '也就是说|换句话说|换言之|具体来说|也就是|亦即|因此|所以|其中|对应|完整|限定|带有|带',
-  '当时|历史|本会话|会话|本次|此次|本轮|当轮|原始|原文|正式|已交付|交付|助手|回答|答文|回复|记录',
+  '也就是说|换句话说|换言之|具体来说|也就是|亦即|因此|所以|其中|内容|包括|对应|完整|限定|带有|带',
+  '当时|采用|使用|用|历史|本会话|会话|本次|此次|本轮|当轮|原始|原文|正式|已交付|交付|助手|回答|答文|回复|记录',
   '当|若|如果|可能|其他|同名|重名|避免|文件名称|文件名|工作簿|工作表|文件|材料|单元格|坐标|定位',
   '出处|来源|引用|援引|版本号|版本|格式|规范|标准|形式|约定|标识|标注|标记|表示|显示|写作|写为|记作|记为|写法|全称',
   '应当|应该|应|也可|可以|可|以及|及|与|和|这份|该|其|这|那|份|个|按照|依照|遵循|根据|依据|按|即|为|是|的|所|了|中|里|于|在|时',
@@ -187,22 +203,27 @@ export function reportedLocatorEvidence(text, question, current, matches) {
       const reported = explicitTurns(part);
       const cells = allowed.filter(match => !reported.size || reported.has(match.turn)).flatMap(match => match.citations);
       const historyLookup = citationLookup(cells);
+      const ids = [...cells, ...current];
       const clauses = part.split(/[；;]/);
       for (const [i, clause] of clauses.entries()) {
-        const refs = extractLocatorMatches(clause);
+        const refs = extractLocatorMatches(maskCitationIds(clause, ids));
         let noteSource = precedingSource;
         if (!refs.length && !noteSource) {
           // A standalone version or ID may also introduce the next source.
-          const nextRef = extractLocatorMatches(clauses[i + 1] || parts[partIndex + 1])[0];
+          const next = clauses[i + 1] || parts[partIndex + 1] || '';
+          const nextRef = extractLocatorMatches(maskCitationIds(next, ids))[0];
           if (!nextRef || !REFERENCE.test(question)) continue;
           noteSource = resolveLocatorToken(nextRef.raw, historyLookup)?.citation;
         }
-        const fields = checkSourceFields(clause, refs, historyLookup, noteSource);
+        const fields = checkSourceFields(clause, refs, historyLookup, noteSource, ids);
         if (!refs.length) {
+          if (fields.idConflict) return { citations: [], conflict: fields.idConflict };
           // Only an adjacent source note can qualify the preceding citation.
-          const sourceNote = /材料|文件|工作簿|版本|引用记录|material|file|version/i.test(clause) && !/当前|现在|最新/.test(clause);
-          if (fields.conflict && sourceNote) return { citations: [], conflict: fields.conflict };
           const noteOnly = sourceFieldsOnly(fields.checked);
+          const describesPresent = /当前|现在|最新/.test(clause) && !HISTORY.test(clause);
+          const sourceNote = !describesPresent && (/材料|文件|工作簿|版本|引用记录|material|file|version/i.test(clause) ||
+            (fields.hasFields && (HISTORY.test(clause) || noteOnly)));
+          if (fields.conflict && sourceNote) return { citations: [], conflict: fields.conflict };
           // A financial gloss can follow a source report after a full stop.
           // The historical hit cannot stand in for a direct read of that cell.
           const cellClaim = /^(?:对应|其|该|这|上述|前述)/.test(clause.trim()) &&
@@ -236,6 +257,9 @@ export function reportedLocatorEvidence(text, question, current, matches) {
         // reading of the same coordinate can belong to a different version.
         const evidence = isReport ? cells : current;
         const lookup = isReport ? historyLookup : citationLookup(current);
+        const idConflict = fields.hasId && !isReport
+          ? checkSourceFields(clause, refs, lookup, undefined, ids).idConflict : fields.idConflict;
+        if (idConflict) return { citations: [], conflict: idConflict };
         if (isReport && fields.conflict) return { citations: [], conflict: fields.conflict };
         for (const { raw } of refs) {
           const source = resolveLocatorToken(raw, lookup)?.citation;

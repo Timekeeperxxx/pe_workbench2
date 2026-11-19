@@ -168,6 +168,31 @@ export function citationLookup(citations) {
   };
 }
 
+// A citation ID is opaque metadata. Its embedded Sheet!A1 is not a
+// second, unqualified locator. Keep offsets stable for lint and HTML rendering.
+export function maskCitationIds(text, citations = [], onField) {
+  const marker = /(?:引用\s*ID|\bcitation[ _-]*id)\s*(?:为|是|[:：=])?\s*[`*]*|\b(?:cite|derived):/gi;
+  let masked = '';
+  let end = 0;
+  for (let match; (match = marker.exec(text));) {
+    const bare = /^(?:cite|derived):$/i.test(match[0]);
+    const start = bare ? match.index : marker.lastIndex;
+    const cited = citations.find(cell => cell.id && text.startsWith(cell.id, start) &&
+      /^(?:$|[\s。，、；！？,!)）\]】”"’'`*;]|[.?](?![\w.-]))/.test(text.slice(start + cell.id.length)));
+    if (!cited) {
+      const token = text.slice(start).match(/^[^\s，。；）)`]*/)[0];
+      onField?.(undefined, text.slice(match.index, start) + token);
+      continue;
+    }
+    const fieldEnd = start + cited.id.length;
+    onField?.(cited, text.slice(match.index, fieldEnd));
+    masked += text.slice(end, match.index) + ' '.repeat(fieldEnd - match.index);
+    end = fieldEnd;
+    marker.lastIndex = end;
+  }
+  return masked + text.slice(end);
+}
+
 /** Return every locator-shaped token, including duplicates, with positions. */
 export function extractLocatorMatches(text) {
   const source = String(text ?? "");
