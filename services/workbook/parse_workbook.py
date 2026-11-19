@@ -29,7 +29,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-PARSER_VERSION = 10
+PARSER_VERSION = 11
 
 try:
     import openpyxl
@@ -248,8 +248,9 @@ def build_labels(
 
 PERIOD_TOKEN = r"(?:(?:[1-4]Q|[12]H|FY)\s*\d{2,4}|(?:19|20)\d{2})(?:[AE])?"
 BASIS_SUFFIX = r"(?:\s*(?:actuals?|forecast|assumption|实际|预测|假设)(?:\s*[;；|]\s*(?:scenario|情景)\s*[:：]\s*[^;；|\n]+)?)?"
-PERIOD_HEADER = re.compile(rf"({PERIOD_TOKEN}){BASIS_SUFFIX}", re.I)
-LOCAL_PERIOD_HEADER = re.compile(rf"({PERIOD_TOKEN})(?:{BASIS_SUFFIX}|\s+(?:P/E|PE|NI|Revenue|EPS).*)", re.I)
+PERIOD_LABEL = rf"({PERIOD_TOKEN})(?:年度?)?"
+PERIOD_HEADER = re.compile(rf"{PERIOD_LABEL}{BASIS_SUFFIX}", re.I)
+LOCAL_PERIOD_HEADER = re.compile(rf"{PERIOD_LABEL}(?:{BASIS_SUFFIX}|\s+(?:P/E|PE|NI|Revenue|EPS).*)", re.I)
 
 
 def period_headers(display, max_row, max_col):
@@ -268,19 +269,26 @@ def period_headers(display, max_row, max_col):
     return headers
 
 
-def local_period_header(display, row, col, headers):
+def local_period_header(display, row, col, headers, *, allow_band=True):
+    contiguous = True
     for r in range(row - 1, 0, -1):
         value = display.get((r, col))
         if value is None:
+            contiguous = False
             continue
         raw = str(value).strip()
         match = LOCAL_PERIOD_HEADER.fullmatch(raw)
-        if not match and not is_text(value):
-            continue
-        if any(LOCAL_PERIOD_HEADER.fullmatch(str(display.get((r, other), "")).strip()) for other in (col-1, col+1)):
-            return r, match.group(1) if match else None, raw
+        if match or is_text(value):
+            if any(LOCAL_PERIOD_HEADER.fullmatch(str(display.get((r, other), "")).strip()) for other in (col-1, col+1)):
+                if allow_band:
+                    return r, match.group(1) if match else None, raw
+                return None
+            if contiguous and is_text(value) and PERIOD_HEADER.fullmatch(raw):
+                return r, match.group(1), raw
+        # Only values and formulas join consecutive rows of a single-column table.
+        contiguous = contiguous and (type(value) in (int, float) or raw.startswith("="))
     original = headers.get(col)
-    return original if original and original[0] < row else None
+    return original if allow_band and original and original[0] < row else None
 
 
 def cell_period(display, headers, row, col, row_label):
@@ -294,13 +302,10 @@ def cell_period(display, headers, row, col, row_label):
     years = re.findall(r"\b(?:19|20)\d{2}[AE]?\b", row_label or "")
     if len(years) == 1:
         return years[0]
-    local = local_period_header(display, row, col, headers)
-    if local is None:
-        return None
-    # An isolated scalar below a period table is a separate block.
-    if any(adj in headers and (row, adj) in display for adj in (col-1, col+1)):
-        return local[1]
-    return None
+    # A scalar below a multi-period band needs another populated period column.
+    in_band = any(adj in headers and (row, adj) in display for adj in (col-1, col+1))
+    local = local_period_header(display, row, col, headers, allow_band=in_band)
+    return local[1] if local else None
 
 
 def scoped_row_labels(display, col_labels):

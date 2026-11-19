@@ -16,6 +16,10 @@ s['G32']='目标价'; s['H32']='2025E'; s['G33']='估值'; s['H33']='=5*2'
 s=w.create_sheet('Segments'); s.append(['毛利率','%','2025E']); s.append(['HBM',None,0.65]); s.append(['收入占比','%','FY26']); s.append(['HBM',None,0.2]); s['D2']='=C2'; s['D4']='=C4'
 s=w.create_sheet('Cover'); s.append(['公司名称','测试公司']); s.append(['证券代码','0700.HK']); s.append(['币种','HKD']); s.append(['估值日期','2026-11-04'])
 s=w.create_sheet('Money'); s.append(['收入','RMB mn','2025E']); s.append(['腾讯',None,7053443])
+s=w.create_sheet('Annual'); s['B1']='2025年'; s.append(['收入',111,112]); s.append(['净利润',33]); s['A5']='独立数值'; s['B5']=14
+s['B6']='2026年度预测；情景：基准'; s['A7']='收入'; s['B7']=120; s['A8']='净利润'; s['B8']='=B7/3'
+s['B9']='另一组指标'; s['A10']='库存'; s['B10']=12
+s=w.create_sheet('Annual band'); s.append(['指标','2024年实际','2025E forecast']); s.append(['收入',10,20]); s.append(['净利润',1,2])
 s=w.create_sheet('Plain'); s['A1']='数值'; s['B1']=123; w.save(sys.argv[1])`,file],{encoding:'utf8'});
  assert.equal(made.status,0,made.stderr);
  const parser=fileURLToPath(new URL('../services/workbook/parse_workbook.py',import.meta.url));
@@ -41,6 +45,17 @@ s=w.create_sheet('Plain'); s['A1']='数值'; s['B1']=123; w.save(sys.argv[1])`,f
  assert.ok(margin.sectionPath.includes('毛利率')); assert.ok(share.sectionPath.includes('收入占比')); assert.equal(margin.unit,'%'); assert.equal(margin.display_unit,'%'); assert.equal(margin.period,'2025E'); assert.equal(share.period,'FY26');
  const money=queryGraph(graph,'Money!C2').cells.find(c=>c.ref==='Money!C2');
  assert.equal(money.unit,'RMB mn'); assert.equal(money.display_unit,'百万元');
+ const annual = ref => queryGraph(graph, ref, {maxCells:1}).cells[0];
+ for (const [coord, value] of [['B2',111], ['B3',33]]) {
+   const cell = annual('Annual!' + coord);
+   assert.equal(cell.value, value); assert.equal(cell.period, '2025'); assert.equal(cell.header, '2025年');
+ }
+ for (const coord of ['C2','B5','B10']) assert.equal(annual('Annual!' + coord).period, null, coord);
+ const forecast = annual('Annual!B8');
+ assert.equal(forecast.period, '2026'); assert.equal(forecast.basis_type, 'forecast'); assert.equal(forecast.scenario, '基准');
+ const actual = annual('Annual band!B3');
+ assert.equal(actual.period, '2024'); assert.equal(actual.basis_type, 'actual');
+ assert.equal(annual('Annual band!C3').period, '2025E');
  const plain=queryGraph(graph,'Plain!B1').cells.find(c=>c.ref==='Plain!B1');
  assert.equal(plain.display_unit,'unit_unknown');
  assert.equal(queryGraph(graph,'HBM',{maxCells:1}).coverage.truncated,true);
