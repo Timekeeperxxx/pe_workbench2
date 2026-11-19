@@ -631,12 +631,107 @@ console.log('target deviation post-answer correction passed');
       const { record } = await runScript([{ tools, text }], question);
       assert.deepEqual([record.status, record.text], [expected, text], question);
     }
+    const twoTerms = '请在第1轮分别查询两个词：“字面常量”，“折旧政策”。分别说明两个词的检索结果和历史出处，列出命中的完整引用 ID。';
+    const zeroTerm = '折旧政策';
+    const noHits = { args: { query: zeroTerm, turn: 1 }, search: {
+      matches: [], totalMatches: 0, coverage: { turns: [1], turnsScanned: 1, truncated: false },
+    } };
+    const withZero = separate + '\n\n“折旧政策”在第1轮未命中。';
+    for (const separator of ['，', '、', '，以及', ', ', '，再查询']) {
+      const question = twoTerms.replace('”，“', '”' + separator + '“');
+      for (const tools of [[failed, success], [success]]) {
+        const { record } = await runScript([{ tools, text: separate }], question);
+        assert.deepEqual([record.status, record.text, record.citations], ['partial', separate, [stored]], question);
+        assert.ok(record.reason.includes(zeroTerm), record.reason);
+      }
+    }
+    for (const tools of [[failed, success, noHits], [failed, noHits, success]]) {
+      const { record } = await runScript([{ tools, text: withZero }], twoTerms);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', withZero, [stored]]);
+    }
+    for (const [statement, expected] of [
+      ['“字面常量”命中，“折旧政策”未命中。', 'completed'],
+      ['“字面常量”未命中，“折旧政策”命中。', 'partial'],
+    ]) {
+      const text = separate + '\n\n' + statement;
+      const { record } = await runScript([{ tools: [failed, success, noHits], text }], twoTerms);
+      assert.equal(record.status, expected, record.reason);
+      if (expected === 'completed') assert.equal(record.text, text);
+      else assert.equal(record.text, separate);
+    }
+    for (const wrong of ['“折旧政策”已命中。', '说明应收账款已严重违反折旧政策。']) {
+      const text = separate + '\n\n“折旧政策”未命中' + (wrong.startsWith('说明') ? '，' : '。') + wrong;
+      const { record } = await runScript([{ tools: [failed, success, noHits], text }], twoTerms);
+      assert.equal(record.status, 'partial');
+      assert.ok(!record.text.includes(wrong) && record.text.includes(canonicalId));
+    }
+    const plainTerms = twoTerms.replaceAll('“', '').replaceAll('”', '');
+    const plainGap = await runScript([{ tools: [failed, success], text: separate }], plainTerms);
+    assert.ok(plainGap.record.reason.includes(zeroTerm), plainGap.record.reason);
+    const missingZero = await runScript([{ tools: [failed, success, noHits], text: separate }], twoTerms);
+    assert.equal(missingZero.record.status, 'partial');
+    assert.ok(missingZero.record.reason.includes(zeroTerm));
+    const falseZero = await runScript([{ tools: [failed, success], text: withZero }], twoTerms);
+    assert.equal(falseZero.record.status, 'partial');
+    assert.equal(falseZero.record.text, separate);
+    for (const [name, expected] of [[stored.filename, 'completed'], ['Budget13.xlsx', 'partial']]) {
+      for (const label of ['这次只看工作簿', '只报告工作簿']) {
+        const question = `请在第1轮查询“字面常量”。${label} ${name} 的历史出处，请给出单元格、材料版本和完整引用 ID。`;
+        const { record } = await runScript([{ tools: [failed, success], text: separate }], question);
+        assert.deepEqual([record.status, record.text], [expected, separate], question);
+        if (expected === 'partial') assert.ok(record.reason.includes(name), record.reason);
+      }
+    }
+    const field = `\`${canonicalId}\``;
+    const naturalDrafts = [
+      `第1轮回答引用的是 [Acceptance13.xlsx]Model!B2，材料 Acceptance13.xlsx（materialId ${stored.materialId}，version 1），命中该条 citation 带的完整引用 ID 为 ${field}。`,
+      `第1轮回答所引用的工作簿是 Acceptance13.xlsx（材料 ${stored.materialId}，版本 1），对应单元格为 [Acceptance13.xlsx]Model!B2；该命中项的完整引用 ID 是 ${field}。\n\n未核验：无`,
+      `第1轮回答引用的出处是：[Acceptance13.xlsx]Model!B2，材料 ID 为 ${stored.materialId}，版本 v1；这篇回答命中的 citation.id 是 ${canonicalId}。`,
+      `第1轮回答引用的出处是：[Acceptance13.xlsx]Model!B2，材料 ID 为 ${stored.materialId}，版本 v1，对应的行号也显示为 [Acceptance13.xlsx]Model!B2；这条引用命中的 citation.id 是 ${canonicalId}。`,
+      `第1轮回答引用的出处是文件 Acceptance13.xlsx（storedFilename 为 ${stored.storedFilename}，materialId 为 ${stored.materialId}，版本为 1）、工作表与单元格 Model!B2，命中该引用时随附的完整引用 ID 是 ${canonicalId}。`,
+      `第1轮回答引用的出处是文件 Acceptance13.xlsx（storedFilename ${stored.storedFilename}，materialId ${stored.materialId}，版本 1）中的 [Acceptance13.xlsx]Model!B2，且该出处所附的完整引用 ID 为 ${canonicalId}。`,
+    ];
+    const coordinateQuestion = request.replace('字面常量', '[Acceptance13.xlsx]Model!B2');
+    const coordinateHit = { ...storedSearch.matches[0], excerpt: '[**Acceptance13.xlsx**]**Model!B2** 储存的是常量。' };
+    const spaced = { args: { query: 'Acceptance13.xlsx Model!B2', turnRange: [1, 1] }, search: { matches: [coordinateHit] } };
+    for (const tools of [[spaced], [failed, spaced]]) {
+      const { record } = await runScript([{ tools, text: naturalDrafts[2] }], coordinateQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', naturalDrafts[2], [stored]]);
+    }
+    const broad = { ...spaced, args: { query: 'Model!B2', turn: 1 } };
+    const notLiteral = { ...spaced, search: { matches: [{ ...coordinateHit, excerpt: 'Model!B2，旁注提到 Acceptance13.xlsx。' }] } };
+    for (const call of [broad, notLiteral]) {
+      const { record } = await runScript([{ tools: [failed, call], text: separate }], coordinateQuestion);
+      assert.equal(record.status, 'partial');
+    }
+    for (const text of naturalDrafts) {
+      const { record } = await runScript([{ tools: [success], text }], request);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [stored]]);
+    }
+    // Labels from the tool schema bind the specific file field to the hit.
+    // Both names belong to this material, but they are not interchangeable.
+    for (const text of [
+      naturalDrafts.at(-1).replace(stored.storedFilename, stored.filename),
+      naturalDrafts.at(-1).replace(stored.storedFilename, 'other-' + stored.storedFilename),
+      naturalDrafts.at(-1).replace(stored.materialId, '00000000-0000-0000-0000-000000000000'),
+      naturalDrafts.at(-1).replace('版本 1', '版本 2'),
+    ]) {
+      const { record } = await runScript([{ tools: [success], text }, { text }], request);
+      assert.notEqual(record.status, 'completed', text);
+      assert.notEqual(record.text, text);
+    }
     // An explicitly requested workbook restricts the fields due from a hit.
     const multiBookSearch = { ...success, search: { matches: [{ ...hit, citations: [stored, secondSource] }] } };
     for (const [name, expected] of [[stored.filename, 'completed'], ['copy+' + stored.filename, 'partial']]) {
       const question = `请在第1轮查询“字面常量”，只报告第1轮正式回答中工作簿 ${name} 的单元格、版本和完整引用 ID。`;
       const { record } = await runScript([{ tools: [failed, multiBookSearch], text: separate }], question);
       assert.deepEqual([record.status, record.text], [expected, separate]);
+    }
+    for (const names of [[stored.filename, 'Budget13.xlsx'], ['Budget13.xlsx', stored.filename]]) {
+      const question = `请在第1轮查询“字面常量”。这次只看工作簿 ${names.join(' 和 ')} 的历史出处，请分别列出引用 ID。`;
+      const { record } = await runScript([{ tools: [failed, success], text: separate }], question);
+      assert.deepEqual([record.status, record.text], ['partial', separate]);
+      assert.ok(record.reason.includes('Budget13.xlsx'));
     }
     // Verified metadata survives a real remaining gap even when written on
     // separate lines. An ID note must stay attached to the cell that owns it.
@@ -668,11 +763,11 @@ console.log('target deviation post-answer correction passed');
     ];
     for (const text of [reportedId, reportedId.replace('（citation.id）完整为', ' ID 为'),
       reportedId.replace('存盘文件名', '存储文件名')]) {
-      const { record } = await runScript([{ search: storedSearch, text }], request);
+      const { record } = await runScript([{ ...success, text }], request);
       assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [stored]]);
     }
     for (const text of [reportedId.replace(canonicalId, 'unrelated-ID'), reportedId.replace(stored.storedFilename, stored.filename)]) {
-      const { record } = await runScript([{ search: storedSearch, text }, { text }], request);
+      const { record } = await runScript([{ ...success, text }, { text }], request);
       assert.deepEqual([record.status, record.text, record.citations], ['failed', '', []]);
     }
     for (const text of reportsWithFilename) {

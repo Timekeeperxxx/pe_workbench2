@@ -13,7 +13,7 @@ import { indexJson, locateChatTopics, recentTopicDialogue } from './topic-locato
 import { updateTopicsFromFacts } from '../../lib/topic-index.mjs';
 
 import { activateQueuedTurn, startTurn, saveTurnDelivery } from './turn-delivery.mjs';
-import { unresolvedSourceSearch } from './transcript-search-recovery.mjs';
+import { sourceSearchGap } from './transcript-search-recovery.mjs';
 import { adoptedCitations, asksHistoricalSource, answerBlocks, answerGaps, blockingFinding, reportedLocatorEvidence, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
 import { presentUserAnswer } from '../../ui/chat/user-facing-answer.js';
 import { CONTEXT_BUDGET_FAILURE, isContextBudgetError } from '../../lib/context-budget.mjs';
@@ -202,7 +202,7 @@ async function generateAnswer(entry, promptText, options, active) {
       const findingsFor = (candidate, checkContext = lintContext) => {
         const lastLine = candidate.slice(candidate.lastIndexOf('\n') + 1);
         const report = candidate === answer ? sourceReport : locatorEvidence(candidate);
-        const verifiedEnding = coverage.verifiedEndings.has(lastLine) || report.endsWithIdField;
+        const verifiedEnding = coverage.verifiedEndings.has(lastLine) || report.endsWithIdField || report.endsWithNoGaps;
         const lint = lintAnswer(candidate, { ...checkContext, locatorCitations: report.citations }).filter(finding =>
           finding.rule !== 'incomplete' || finding.message !== '句末可能截断' || !verifiedEnding);
         if (report.conflict) lint.push({
@@ -225,6 +225,7 @@ async function generateAnswer(entry, promptText, options, active) {
       const lastVerifiedRead = candidateCalls.findLastIndex(call => call.name === 'workbook_query' && call.success &&
         collectCitationsFromToolCalls([call]).some(citation => adoptedIds.has(citation.id)));
       for (const gap of new Set([...answerGaps(answer), ...coverage.missing])) {
+        if (gap === '无' && sourceReport.endsWithNoGaps) continue;
         findings.push({ rule: 'delivery_gap', severity: 'error', message: `未核验：${gap}`, excerpt: gap });
       }
       if (message.stopReason === 'length' && !findings.some(f => f.rule === 'incomplete')) {
@@ -249,11 +250,12 @@ async function generateAnswer(entry, promptText, options, active) {
       const latestTools = new Map();
       for (const call of candidateCalls) latestTools.set(call.name + JSON.stringify(call.args || {}), call);
       const sourceQuestion = asksHistoricalSource(text);
-      const searchGap = sourceQuestion && unresolvedSourceSearch(text, answer, scanned, toolCalls, sourceReport.historical);
-      const failedTool = searchGap || [...latestTools.values()].find(call => !call.success &&
+      const searchGap = sourceQuestion && sourceSearchGap(text, answer, scanned, toolCalls, sourceReport.historical, blocks, coverage,
+        clause => Boolean(locatorEvidence(clause).historical?.length) && !findingsFor(clause).some(blockingFinding));
+      const failedTool = [...latestTools.values()].find(call => !call.success &&
         !(sourceQuestion && call.name === 'transcript_search') &&
         (call.name !== 'workbook_query' || candidateCalls.lastIndexOf(call) >= lastVerifiedRead));
-      const toolGap = failedTool ? `工具 ${failedTool.name} 执行失败。` : '';
+      const toolGap = [searchGap, failedTool && `工具 ${failedTool.name} 执行失败。`].filter(Boolean).join('；');
       if (blocking.length || !answer || toolGap) {
         safeText = verifiedPortion(answer, blocks, locatorEvidence,
           part => findingsFor(part, { ...lintContext, requiredSections: [] }), coverage);

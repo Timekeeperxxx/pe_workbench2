@@ -191,13 +191,13 @@ function toolRowHTML(tool) {
     </div>${card ? `<div class="tool-card-slot">${card}</div>` : ''}`;
 }
 
-function toolGroupHTML(tools = [], { live = false, processText = '', highlightBudget = { remaining: 4 }, incomplete = false } = {}) {
+function toolGroupHTML(tools = [], { live = false, processText = '', highlightBudget = { remaining: 4 }, incomplete = false, open = false } = {}) {
   if (!tools.length && !processText) return '';
   const errors = tools.filter(tool => tool.status === 'error').length;
   const label = live ? liveStatusText() : (tools.length ? `过程 · ${tools.length} 个工具调用` : '过程');
   const meta = live ? (tools.length ? `第 ${tools.length} 步` : '') : (incomplete ? '未完成' : (errors ? `${errors} 个失败` : '已完成'));
   const status = live ? ' id="liveStatus" aria-live="polite"' : '';
-  return `<details class="tool-group">
+  return `<details class="tool-group"${open ? ' open' : ''}>
       <summary class="tool-summary">
         ${icon('chevron-right', 12)}
         <span class="tool-summary-label"${status}>${esc(label)}</span>
@@ -288,7 +288,7 @@ async function hydrateReports(root = threadEl) {
   }
 }
 
-function messageHTML(m) {
+function messageHTML(m, { openGroups } = {}) {
   const highlightBudget = { remaining: 4 };
   const isUser = m.role === 'user';
   const delivered = !isUser && Boolean(m.turnId);
@@ -309,9 +309,12 @@ function messageHTML(m) {
     pendingMerge: delivered ? m.analysisStatePendingMerge === true
       : typeof state !== 'undefined' && (state.pendingMerges || []).some(item => item.path === m.analysisStatePath),
   }) : '';
-  const group = isUser ? '' : toolGroupHTML(m.tools || [], { processText: m.processText || '', highlightBudget, incomplete: Boolean(m.failure || cancelled || (delivered && m.status !== 'completed')) });
+  const callId = m.tools?.find(tool => tool.id)?.id;
+  const groupKey = m.turnId ? 'turn:' + m.turnId : callId ? 'call:' + callId : '';
+  const group = isUser ? '' : toolGroupHTML(m.tools || [], { processText: m.processText || '',
+    open: openGroups?.has(groupKey), highlightBudget, incomplete: Boolean(m.failure || cancelled || (delivered && m.status !== 'completed')) });
   const reports = isUser ? '' : reportPathsFor(m).map(path => reportCardHTML(path, highlightBudget)).join('');
-  return `<article class="msg ${isUser ? 'user' : 'assistant'}">
+  return `<article class="msg ${isUser ? 'user' : 'assistant'}"${group && groupKey ? ` data-process-key="${esc(groupKey)}"` : ''}>
       <span class="msg-avatar">${isUser ? '林' : icon('spark', 15)}</span>
       <div>
         <div class="msg-head"><span class="msg-name">${isUser ? '林默' : 'Workbench'}</span><span class="msg-time">${esc(m.time || '')}</span></div>
@@ -455,6 +458,18 @@ function pendingMergesBadgeHTML() {
   return (state.pendingMerges || []).length ? '<div class="tc-note"><span class="ap-badge warn">有待并入的更正</span></div>' : '';
 }
 
+let renderedSession;
+function historyHTML(messages) {
+  const openGroups = new Set();
+  if (renderedSession === state.activeSession) {
+    for (const group of threadEl.querySelectorAll('[data-process-key] .tool-group[open]')) {
+      openGroups.add(group.closest('[data-process-key]').dataset.processKey);
+    }
+  }
+  renderedSession = state.activeSession;
+  return messages.map(message => messageHTML(message, { openGroups })).join('');
+}
+
 function renderThread(scroll = false) {
   threadScroll ||= getThreadScroll(threadEl);
   const restoreScroll = threadScroll.capture(scroll);
@@ -475,7 +490,7 @@ function renderThread(scroll = false) {
   }
   if (showLive) {
     if (!liveArticle || !threadEl.contains(liveArticle)) {
-      threadEl.innerHTML = `<div class="thread-inner">${pendingMergesBadgeHTML()}${approvalsShelfHTML()}${messages.map(messageHTML).join('')}${liveMessageHTML()}</div>`;
+      threadEl.innerHTML = `<div class="thread-inner">${pendingMergesBadgeHTML()}${approvalsShelfHTML()}${historyHTML(messages)}${liveMessageHTML()}</div>`;
       liveArticle = threadEl.querySelector('#liveMsg');
       renderTraceHitl();
       void hydrateReports(threadEl);
@@ -486,7 +501,7 @@ function renderThread(scroll = false) {
     restoreScroll();
     return;
   }
-  threadEl.innerHTML = `<div class="thread-inner">${pendingMergesBadgeHTML()}${approvalsShelfHTML()}${messages.map(messageHTML).join('')}</div>`;
+  threadEl.innerHTML = `<div class="thread-inner">${pendingMergesBadgeHTML()}${approvalsShelfHTML()}${historyHTML(messages)}</div>`;
   liveArticle = null;
   renderTraceHitl();
   void hydrateReports(threadEl);

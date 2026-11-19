@@ -80,7 +80,7 @@ function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
     if (names.length) {
       const alternatives = names.map(name => name.normalize('NFKC').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
         .sort((a, b) => b.length - a.length).join('|');
-      const nameField = String.raw`(?:(实际存储|存储|存盘|落盘|实际上传|磁盘|显示|原始)(?:文件)?名(?:称)?|(?:工作簿(?:文件)?|(?:上传)?文件)(?:名(?:称)?)?)\s*(?:为|是|:)?\s*`;
+      const nameField = String.raw`(?:((?:实际存储|存储|存盘|落盘|实际上传|磁盘|显示|原始)(?:文件)?名(?:称)?|\bstoredFilename\b|\bfilename\b)|(?:工作簿(?:文件)?|(?:上传)?文件)(?:名(?:称)?)?)\s*(?:为|是|:)?\s*`;
       const ending = String.raw`(?![\w-]|\.[\w.-])`;
       const knownName = String.raw`(?:\[(${alternatives})\]|(${alternatives})${ending})`;
       // At a label, consume the whole written workbook name, including
@@ -91,7 +91,7 @@ function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
         hasFields = true;
         if (otherBracketed || otherPlain) conflict = field;
         else if (kind) {
-          const expected = /存储|存盘|落盘|上传|磁盘/.test(kind) ? source.storedFilename : source.filename;
+          const expected = /存储|存盘|落盘|上传|磁盘|^storedFilename$/.test(kind) ? source.storedFilename : source.filename;
           if (expected?.normalize('NFKC') !== (bracketed || plain)) conflict = field;
         }
         return ' ';
@@ -152,16 +152,20 @@ const SOURCE_WORDS = new RegExp([
   '当时|采用|使用|用|历史|本会话|会话|本次|此次|本轮|当轮|原始|原文|正式|已交付|交付|助手|回答|答文|回复|记录',
   '当|若|如果|可能|其他|同名|重名|避免|文件名称|文件名|工作簿|工作表|文件|材料|单元格|坐标|定位',
   '出处|来源|引用|援引|版本号|版本|格式|规范|标准|形式|约定|标识|标注|标记|表示|显示|写作|写为|记作|记为|写法|全称',
-  '应当|应该|应|也可|可以|可|以及|及|与|和|这份|该|其|这|那|份|个|按照|依照|遵循|根据|依据|按|即|为|是|的|所|了|中|里|于|在|时',
+  '应当|应该|应|也可|可以|可|以及|及|与|和|且|这份|该|其|这|那|份|个|按照|依照|遵循|根据|依据|按|即|为|是|的|所|了|中|里|于|在|时',
 ].join('|'), 'g');
 // A verified ID field can also identify the search result that supplied it.
 // Interpret those words only in a clause containing a checked ID; keep every
 // other assertion for the source and financial checks below.
-const SEARCH_TERMS = /transcript_search|命中项?|匹配项?|检索|搜索|查询|工具|结果|返回|提供|给出|携带|附带|所附|条/gi;
+const SEARCH_TERMS = /\bcitations?\b|transcript_search|命中项?|匹配项?|检索|搜索|查询|工具|结果|返回|提供|给出|携带|附带|随附|所附|条/gi;
 const SOURCE_POINTER = /(?:这(?:条|个|一)?|该|其|此|上述|前述)(?:引用|出处|来源|记录)(?:所)?(?:指向|指的(?:是)?|对应(?:于)?)/;
 function sourceFieldsOnly(part, hasId) {
-  if (hasId) part = part.replace(/(?:由)?[他她它](?:所)?(?=引用|援引|提供|返回|给出|携带)/g, '').replace(SEARCH_TERMS, '');
-  return !part.replace(new RegExp(LOCATOR_SOURCE, 'g'), ' ')
+  if (hasId) {
+    part = part.replace(/(?:这|那|该|此)一?(?:篇|条|份|则|个)(?=\s*(?:正式|回答|答文|回复|记录|命中|引用|citation))/gi, '')
+      .replace(/(?:由)?[他她它](?:所)?(?=引用|援引|提供|返回|给出|携带)/g, '').replace(SEARCH_TERMS, '');
+  }
+  return !part.replace(new RegExp('(?:对应的)?(?:行号|坐标)(?:也)?显示为\\s*(?=' + LOCATOR_SOURCE + ')', 'g'), '')
+    .replace(new RegExp(LOCATOR_SOURCE, 'g'), ' ')
     .replace(/第\s*[零一二三四五六七八九十百千\d]+\s*[轮次]/g, '')
     .replace(new RegExp(SOURCE_POINTER.source, 'g'), '')
     .replace(SOURCE_WORDS, '')
@@ -169,7 +173,7 @@ function sourceFieldsOnly(part, hasId) {
 }
 
 const ALTERNATE_SPELLING = /(?:写作|写为|记作|记为|表示为)\s*[:：]?\s*$/;
-const RESTATEMENT = /也就是说|也就是|换句话说|换言之|亦即|(?:写作|写为|记作|记为|表示为)\s*[:：]?\s*$/;
+const RESTATEMENT = /(?:行号|坐标)(?:也)?显示为\s*$|也就是说|也就是|换句话说|换言之|亦即|(?:写作|写为|记作|记为|表示为)\s*[:：]?\s*$/;
 function reportsHistoricalSource(part, refs, question, hasId) {
   let description = part.replace(new RegExp(LOCATOR_SOURCE, 'g'), ' ');
   const historicalSubject = HISTORY.test(description);
@@ -395,7 +399,8 @@ export function reportedLocatorEvidence(text, question, current, matches, workbo
   maskCitationIds(lastLine, citations, (cell, field) => {
     if (cell && lastLine.endsWith(field) && (field !== cell.id || lastLine.trim() === field)) endsWithIdField = true;
   });
-  return { citations, endsWithIdField, historical: [...historical.values()] };
+  const endsWithNoGaps = /^未核验[：:]\s*无[。.]?$/.test(lastLine.trim());
+  return { citations, endsWithIdField, endsWithNoGaps, historical: [...historical.values()] };
 }
 
 export function joinContinuation(prefix, delta) {
@@ -445,7 +450,7 @@ function requestedItems(question) {
 // Keep the original Markdown for delivery. A table row is a single claim
 // unit, just as a sentence is in prose. Its header belongs to the retained rows.
 export function answerBlocks(text) {
-  const prose = raw => ({ parts: raw.split(/(?<=[。！？])|(?<=[.!?])(?=\s|$)|\n+/).map(s => s.trim()).filter(Boolean) });
+  const prose = raw => ({ raw, parts: raw.split(/(?<=[。！？])|(?<=[.!?])(?=\s|$)|\n+/).map(s => s.trim()).filter(Boolean) });
   if (!text.includes('|')) return [prose(text)];
   return Lexer.lex(text).map(token => {
     if (token.type !== 'table') return prose(token.raw);
@@ -551,7 +556,7 @@ export function verifiedPortion(answer, blocks, reportFor, findingsFor, coverage
   const verified = [];
   const anchors = [];
   let retainedAll = true;
-  for (const { header, parts } of blocks) {
+  for (const { header, raw, parts } of blocks) {
     const eligible = part => !coverage.unsupported.has(part) && (!coverage.missing.length || coverage.supported.has(part));
     const sources = new Map();
     const kept = parts.map((part, index) => {
@@ -584,7 +589,23 @@ export function verifiedPortion(answer, blocks, reportFor, findingsFor, coverage
     }
     retainedAll &&= kept.every(Boolean);
     const rows = parts.filter((_, i) => kept[i]);
-    if (rows.length) verified.push(render(rows));
+    if (rows.length) {
+      // Keep the Markdown between adjacent verified sentences and fields.
+      // A run ends at every omitted claim so its text cannot leak back in.
+      if (raw && sources.size) {
+        let offset = 0;
+        let start = -1;
+        for (const [i, part] of parts.entries()) {
+          const at = raw.indexOf(part, offset);
+          if (kept[i] && start < 0) start = at;
+          offset = at + part.length;
+          if (kept[i] && !kept[i + 1]) {
+            verified.push(raw.slice(start, offset));
+            start = -1;
+          }
+        }
+      } else verified.push(render(rows));
+    }
   }
   const body = retainedAll ? answer : verified.join('\n\n');
   if (body && !findingsFor(body).some(blockingFinding)) return body;

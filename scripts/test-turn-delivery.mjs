@@ -460,7 +460,7 @@ sys.stdout.buffer.write(data.getvalue())
 
   // Check the content within each call. Its arguments, the answer body and a
   // neighbouring result can all contain the search term or the same locator.
-  async function checkResults(group, calls, book) {
+  async function checkResults(group, calls, book, afterFirst) {
     if (!(await group.evaluate(node => node.open))) await group.locator(":scope > summary").click();
     assert.match(await group.innerText(), /Model!B2/, "expanded search must show the returned locator");
     for (const [i, { toolCallId }] of calls.entries()) {
@@ -472,6 +472,7 @@ sys.stdout.buffer.write(data.getvalue())
         assert.match(text, /第\s*1\s*轮.*正式回答/);
         assert.ok(text.replaceAll("**", "").includes(original), text);
         assert.ok(await card.locator(`[data-material-id="${book.material.id}"][data-version="1"][data-locator="Model!B2"]`).isVisible());
+        if (afterFirst) await afterFirst();
       } else {
         assert.match(text, /历史问答未命中/);
         assert.ok(!text.includes("Model!B2"), text);
@@ -623,7 +624,11 @@ sys.stdout.buffer.write(data.getvalue())
             const row = answers(viewer.page).nth(1);
             await row.waitFor();
             await viewer.ready();
-            await checkResults(row.locator(".tool-group"), calls, book);
+            await checkResults(row.locator(".tool-group"), calls, book, view === "reconnect" && (async () => {
+              // A late recovery snapshot can arrive while the user reads an open group.
+              await viewer.page.evaluate(async () => (await import("/ui/runtime.js")).runtime.refreshSnapshot({ watch: false }));
+              await viewer.page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+            }));
             assert.deepEqual(await answers(viewer.page).locator(".msg-body").allInnerTexts(), [original, historical]);
           });
         }
@@ -639,6 +644,12 @@ sys.stdout.buffer.write(data.getvalue())
         const idReport = `第 1 轮回答引用的出处：工作簿 ${filename}，单元格 Model!B2，材料 ID ${book.material.id}，材料版本 v1。\n\n完整 citation.id：${citationId}`;
         const retryQuestion = `请调用 transcript_search 在本会话第1轮历史中查询“${queries[0]}”。只报告正式回答的出处、材料版本和完整 citation.id。`;
         const cases = [
+          { ending: "逗号分隔的第二词尚未查询", answer: idReport, badArgs: {}, partial: true, gap: "折旧政策",
+            question: `请在第1轮分别查询两个词：“${queries[0]}”，“折旧政策”。分别说明两个词的检索结果和历史出处，列出命中的完整引用 ID。`, inspect: true },
+          { ending: "只看另一本工作簿", answer: idReport, badArgs: {}, partial: true, gap: "Budget13.xlsx",
+            question: `请在第1轮查询“${queries[0]}”。这次只看工作簿 Budget13.xlsx 的历史出处，请给出单元格、材料版本和完整引用 ID。`, inspect: true },
+          { ending: "命中该条 citation 带的完整引用", answer: `第1轮回答引用的是 [${filename}]Model!B2，材料 ${filename}（materialId ${book.material.id}，version 1），命中该条 citation 带的完整引用 ID 为 \`${citationId}\`。`, inspect: true },
+          { ending: "这篇回答命中的 citation.id", answer: `第1轮回答引用的出处是：[${filename}]Model!B2，材料 ID 为 ${book.material.id}，版本 v1；这篇回答命中的 citation.id 是 ${citationId}。`, inspect: true },
           { ending: "裸材料 UUID", answer: `第1轮回答引用的出处是 [${filename}]Model!B2（材料 ${book.material.id}，版本 v1${storageNote}），该命中记录带的完整引用 ID 为 ${citationId}。`, inspect: true },
           { ending: "单列正确 ID", answer: idReport, inspect: true },
           { ending: "补齐参数命中后单列 ID", answer: idReport, badArgs: {}, inspect: true },
@@ -664,7 +675,7 @@ sys.stdout.buffer.write(data.getvalue())
         ];
         const coldReplies = [];
         coldCases.push({ transport, history, id, materialId: book.material.id, coldReplies });
-        for (const [variant, { ending, answer, inspect, reject, invalid, scoped, read, badArgs, partial }] of cases.entries()) {
+        for (const [variant, { ending, answer, inspect, reject, invalid, scoped, read, badArgs, partial, question: searchQuestion, gap }] of cases.entries()) {
           await t.test(`reported source ${ending === "。" ? "without version" : ending}${read ? " after workbook_query" : ""}`, async t => {
             const prefix = scoped ? originalSource : source;
             const text = answer ?? prefix + ending;
@@ -676,7 +687,7 @@ sys.stdout.buffer.write(data.getvalue())
               { text, pause: true }, { text },
             ]);
             t.after(model.resume);
-            await ui.send(badArgs ? retryQuestion : scoped ? scopedQuestion : question);
+            await ui.send(searchQuestion ?? (badArgs ? retryQuestion : scoped ? scopedQuestion : question));
             await bounded(model.paused, "version follow-up did not reach its answer");
             const results = branch().slice(start).map(row => row.message).filter(m => m?.role === "toolResult");
             if (badArgs) {
@@ -705,6 +716,7 @@ sys.stdout.buffer.write(data.getvalue())
             if (invalid) {
               assert.ok(!delivered.text.includes(invalid), `unverified source was delivered: ${delivered.text}`);
             }
+            if (gap) assert.ok(delivered.reason?.includes(gap), JSON.stringify(delivered));
             if (scoped && invalid) assert.equal(delivered.status, "partial");
             if (reject || (invalid && delivered.status === "failed")) {
               assert.deepEqual([delivered.status, delivered.text, delivered.citations], ["failed", "", []]);
@@ -747,7 +759,7 @@ sys.stdout.buffer.write(data.getvalue())
       await t.test(`Chrome ${transport} ${history}: exact versioned source after process restart`, async t => {
         const ui = await open(t, transport, origin);
         await ui.select(id);
-        assert.equal(coldReplies.length, 19);
+        assert.equal(coldReplies.length, 23);
         for (const { record, index } of coldReplies) {
           const body = await checkReply(ui, record, index);
           if (record.status === "completed") await openOriginalCell(ui.page, body, materialId);
