@@ -434,14 +434,16 @@ console.log('target deviation post-answer correction passed');
       emit({ type: 'agent_start' });
       try {
         if (step.error) throw new Error(step.error);
-        if (step.citations || step.search || step.toolError) {
-          const toolCallId = 'tool-' + attempts;
-          const toolName = step.search ? 'transcript_search' : 'workbook_query';
-          append({ role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: toolCallId, name: toolName, arguments: {} }] });
-          emit({ type: 'tool_execution_start', toolCallId, toolName, args: {} });
+        const calls = step.tools ?? (step.citations || step.search || step.toolError ? [step] : []);
+        for (const [i, call] of calls.entries()) {
+          const toolCallId = 'tool-' + attempts + '-' + i;
+          const toolName = call.name ?? (call.search ? 'transcript_search' : 'workbook_query');
+          const args = call.args ?? {};
+          append({ role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: toolCallId, name: toolName, arguments: args, argumentsError: call.argumentsError }] });
+          emit({ type: 'tool_execution_start', toolCallId, toolName, args });
           const result = {
-            role: 'toolResult', toolName, toolCallId, isError: Boolean(step.toolError),
-            content: [{ type: 'text', text: step.toolError || 'ok' }], details: step.search || { citations: step.citations || [] },
+            role: 'toolResult', toolName, toolCallId, isError: Boolean(call.toolError),
+            content: [{ type: 'text', text: call.toolError || 'ok' }], details: call.search || { citations: call.citations || [] },
           };
           append(result);
           emit({ type: 'tool_execution_end', toolCallId, toolName, result, isError: result.isError });
@@ -578,10 +580,101 @@ console.log('target deviation post-answer correction passed');
       assert.deepEqual([record.status, record.text, record.citations],
         prefix ? ['failed', '', []] : ['completed', text, [stored]]);
     }
+    const bareSource = `第1轮回答引用的出处是 [Acceptance13.xlsx]Model!B2（材料 ${stored.materialId}，版本 v1，存储文件名 ${stored.storedFilename}），该命中记录带的完整引用 ID 为 ${canonicalId}。`;
+    const otherUuid = '8a4d70d1-012b-4f68-a409-58229df21e15';
+    for (const material of [`材料 ${stored.materialId}`, `材料 ID ${stored.materialId}`,
+      `材料 ${stored.materialId}，材料 ID ${stored.materialId}`]) {
+      const text = bareSource.replace('材料 ' + stored.materialId, material);
+      const { record } = await runScript([{ search: storedSearch, text }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [stored]]);
+    }
+    for (const material of [`材料 ${otherUuid}`, `材料 ${stored.materialId}，材料 ID ${otherUuid}`,
+      `材料 ID ${stored.materialId}，材料 ${otherUuid}`]) {
+      const text = bareSource.replace('材料 ' + stored.materialId, material);
+      const { record } = await runScript([{ search: storedSearch, text }, { text }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['failed', '', []]);
+    }
+
+    const query = '字面常量';
+    const request = '请调用 transcript_search 在本会话第1轮历史中查询“字面常量”。只报告第1轮已交付回答所引用的工作簿、单元格、材料版本和命中所带的完整引用 ID（citation.id）。只问历史出处，不重报读数、期间或财务事实。';
+    const locatorLine = `第 1 轮回答引用的出处：工作簿 Acceptance13.xlsx（存储名 ${stored.storedFilename}），单元格 Model!B2，材料 ID ${stored.materialId}，材料版本 v1。`;
+    const idLine = '完整 citation.id：' + canonicalId;
+    const separate = locatorLine + '\n\n' + idLine;
+    const success = { args: { query, turn: 1 }, search: storedSearch };
+    const failed = { name: 'transcript_search', toolError: 'invalid arguments' };
+    for (const [tools, expected] of [
+      [[success], 'completed'],
+      [[failed, success], 'completed'],
+      [[{ ...failed, args: { query, turnRange: [1, 1] } }, success], 'completed'],
+      [[{ ...failed, args: { query: '另一目标', turn: 1 } }, success], 'partial'],
+      [[{ ...failed, args: { query, turn: 2 } }, success], 'partial'],
+      [[{ ...failed, args: { query, turnRange: [1, 2] } }, success], 'partial'],
+      [[failed, { ...success, args: { query: '其他命中词', turn: 1 } }], 'partial'],
+      [[{ ...failed, argumentsError: 'Invalid JSON\n\nReceived arguments:\n{"query":"另一目标","turn"' }, success], 'partial'],
+      [[success, failed], 'partial'],
+    ]) {
+      const { record } = await runScript([{ tools, text: separate }], request);
+      assert.deepEqual([record.status, record.text, record.citations], [expected, separate, [stored]]);
+    }
+    const secondSource = { ...stored, id: 'cite:second:v1:Model!A1', materialId: 'second', locator: 'Model!A1', filename: 'Other.xlsx' };
+    const secondHit = { ...hit, turn: 2, citations: [secondSource] };
+    const secondSearch = { args: { query: '复核范围', turn: 2 }, search: { matches: [secondHit] } };
+    const twoRequests = '请在第1轮查询“字面常量”，再在第2轮查询“复核范围”，分别报告两份正式答文的出处。';
+    const secondAnswer = '第2轮正式回答引用的是 [Other.xlsx]Model!A1。';
+    for (const [question, tools, text, expected] of [
+      [request.replace('完整引用 ID', '“完整引用 ID”'), [failed, success], separate, 'completed'],
+      [request.replace('“字面常量”', '字面常量'), [failed, success], separate, 'completed'],
+      [twoRequests, [failed, success, secondSearch], separate + '\n\n' + secondAnswer, 'completed'],
+      [twoRequests, [{ ...failed, args: { query } }, { ...success, args: { query } }], separate, 'partial'],
+      [twoRequests, [failed, success, secondSearch], separate, 'partial'],
+    ]) {
+      const { record } = await runScript([{ tools, text }], question);
+      assert.deepEqual([record.status, record.text], [expected, text], question);
+    }
+    // An explicitly requested workbook restricts the fields due from a hit.
+    const multiBookSearch = { ...success, search: { matches: [{ ...hit, citations: [stored, secondSource] }] } };
+    for (const [name, expected] of [[stored.filename, 'completed'], ['copy+' + stored.filename, 'partial']]) {
+      const question = `请在第1轮查询“字面常量”，只报告第1轮正式回答中工作簿 ${name} 的单元格、版本和完整引用 ID。`;
+      const { record } = await runScript([{ tools: [failed, multiBookSearch], text: separate }], question);
+      assert.deepEqual([record.status, record.text], [expected, separate]);
+    }
+    // Verified metadata survives a real remaining gap even when written on
+    // separate lines. An ID note must stay attached to the cell that owns it.
+    const otherFailure = { name: 'workbook_trace', toolError: 'other file is unavailable' };
+    const listed = `工作簿：Acceptance13.xlsx\n材料 ${stored.materialId}，版本 v1\n第一轮正式回答引用的是 Model!B2。\n${idLine}`;
+    const incompleteReport = await runScript([{ tools: [otherFailure, success], text: listed }], request);
+    assert.deepEqual([incompleteReport.record.status, incompleteReport.record.text, incompleteReport.record.citations],
+      ['partial', listed, [stored]]);
+    for (const aside of ['出处详情', '当前值为 999 万元。']) {
+      const text = locatorLine + '\n\n' + aside + '\n\n' + idLine;
+      const steps = [{ tools: [otherFailure, success], text }];
+      if (aside.includes('999')) steps.push({ text }); // repeat the unsupported claim on correction
+      const { record } = await runScript(steps, request);
+      assert.equal(record.status, 'partial');
+      assert.ok(record.text.includes(locatorLine) && record.text.includes(idLine), record.text);
+      assert.ok(!record.text.includes('999'));
+    }
+    for (const bad of [idLine.replace(':v1:', ':v2:'), idLine + '，该值为 999 万元。']) {
+      const text = locatorLine + '\n\n' + bad;
+      const steps = [{ tools: [otherFailure, success], text }, { text }];
+      if (!bad.endsWith('。')) steps.push({ text }); // incorrect unterminated ID also triggers continuation
+      const { record } = await runScript(steps, request);
+      assert.ok(!record.text.includes(bad), record.text);
+    }
+    const reportedId = `第1轮回答引用了工作簿 Acceptance13.xlsx（存盘文件名 ${stored.storedFilename}）、单元格 Model!B2、材料 ID ${stored.materialId}、材料版本 v1，命中的引用（citation.id）完整为：${canonicalId}。`;
     const reportsWithFilename = [
       `第1轮已交付回答引用的出处是 [Acceptance13.xlsx]Model!B2（材料 ID：${stored.materialId}，版本 1；存储文件名：${stored.storedFilename}），命中的完整引用 ID 为 ${canonicalId}。`,
       `第1轮已交付回答引用的出处是 [Acceptance13.xlsx]Model!B2，材料 ID 为 ${stored.materialId}（版本 1），存储文件名是 ${stored.storedFilename}，命中的完整引用 ID 为 ${canonicalId}。`,
     ];
+    for (const text of [reportedId, reportedId.replace('（citation.id）完整为', ' ID 为'),
+      reportedId.replace('存盘文件名', '存储文件名')]) {
+      const { record } = await runScript([{ search: storedSearch, text }], request);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [stored]]);
+    }
+    for (const text of [reportedId.replace(canonicalId, 'unrelated-ID'), reportedId.replace(stored.storedFilename, stored.filename)]) {
+      const { record } = await runScript([{ search: storedSearch, text }, { text }], request);
+      assert.deepEqual([record.status, record.text, record.citations], ['failed', '', []]);
+    }
     for (const text of reportsWithFilename) {
       const { record } = await runScript([{ search: storedSearch, text }], sourceQuestion);
       assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [stored]]);

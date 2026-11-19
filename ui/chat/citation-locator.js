@@ -178,7 +178,9 @@ export function citationLookup(citations) {
 const idLabel = String.raw`(?:引用\s*ID|\bcitation[ ._-]*id)`;
 const labelStyle = '[`*\\s]*';
 const alias = `(?:[（(]${labelStyle}${idLabel}${labelStyle}[)）]${labelStyle})?`;
-const idMarker = idLabel + labelStyle + alias + '(?:字段)?(?:为|是)?\\s*[:：=]?\\s*[`*]*';
+const parenthesizedLabel = `(?:引用)?[（(]${labelStyle}${idLabel}${labelStyle}[)）]`;
+const idMarker = `(?:${parenthesizedLabel}|${idLabel}${labelStyle}${alias})` + labelStyle +
+  '(?:字段)?(?:完整(?:值|形式)?)?(?:为|是)?\\s*[:：=]?\\s*[`*]*';
 
 // A citation ID is opaque metadata. Its embedded Sheet!A1 is not a
 // second, unqualified locator. Keep offsets stable for lint and HTML rendering.

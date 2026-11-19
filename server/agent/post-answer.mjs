@@ -13,7 +13,8 @@ import { indexJson, locateChatTopics, recentTopicDialogue } from './topic-locato
 import { updateTopicsFromFacts } from '../../lib/topic-index.mjs';
 
 import { activateQueuedTurn, startTurn, saveTurnDelivery } from './turn-delivery.mjs';
-import { adoptedCitations, answerBlocks, answerGaps, blockingFinding, reportedLocatorEvidence, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
+import { unresolvedSourceSearch } from './transcript-search-recovery.mjs';
+import { adoptedCitations, asksHistoricalSource, answerBlocks, answerGaps, blockingFinding, reportedLocatorEvidence, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
 import { presentUserAnswer } from '../../ui/chat/user-facing-answer.js';
 import { CONTEXT_BUDGET_FAILURE, isContextBudgetError } from '../../lib/context-budget.mjs';
 
@@ -127,7 +128,7 @@ async function generateAnswer(entry, promptText, options, active) {
   };
   const unsubscribe = entry.session.subscribe?.(event => {
     if (event.type === 'message_end' && event.message?.role === 'assistant') latestMessage = event.message;
-    if (event.type === 'tool_execution_start') toolCalls.push({ id: event.toolCallId, name: event.toolName, args: event.args, success: false });
+    if (event.type === 'tool_execution_start') toolCalls.push({ id: event.toolCallId, name: event.toolName, args: event.args, messageIndex: entry.session.messages.length, success: false });
     if (event.type === 'tool_execution_end') {
       const call = toolCalls.findLast(c => c.id === event.toolCallId);
       if (call) {
@@ -165,7 +166,7 @@ async function generateAnswer(entry, promptText, options, active) {
       for (const [index, m] of messages.entries()) for (const c of Array.isArray(m.content) ? m.content : []) {
         if (c.type !== 'toolCall') continue;
         const result = messages.find(r => r.role === 'toolResult' && r.toolCallId === c.id);
-        scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, success: Boolean(result) && result.isError === false, details:result?.details, result });
+        scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, argumentsError: c.argumentsError, success: Boolean(result) && result.isError === false, details:result?.details, result });
       }
       for(const call of scanned) if(call.success) registrationJobs.push(registerToolResult(entry.ctx?.root,entry.id,call,{turn}).catch(()=>[]));
       const registered= (await Promise.all(registrationJobs)).flat().filter(Boolean);
@@ -247,11 +248,14 @@ async function generateAnswer(entry, promptText, options, active) {
       // toward recovery if the final answer actually cites its evidence.
       const latestTools = new Map();
       for (const call of candidateCalls) latestTools.set(call.name + JSON.stringify(call.args || {}), call);
-      const failedTool = [...latestTools.values()].find(call => !call.success &&
+      const sourceQuestion = asksHistoricalSource(text);
+      const searchGap = sourceQuestion && unresolvedSourceSearch(text, answer, scanned, toolCalls, sourceReport.historical);
+      const failedTool = searchGap || [...latestTools.values()].find(call => !call.success &&
+        !(sourceQuestion && call.name === 'transcript_search') &&
         (call.name !== 'workbook_query' || candidateCalls.lastIndexOf(call) >= lastVerifiedRead));
       const toolGap = failedTool ? `工具 ${failedTool.name} 执行失败。` : '';
       if (blocking.length || !answer || toolGap) {
-        safeText = verifiedPortion(blocks, part => locatorEvidence(part).citations,
+        safeText = verifiedPortion(answer, blocks, locatorEvidence,
           part => findingsFor(part, { ...lintContext, requiredSections: [] }), coverage);
         safeCitations = adoptedCitations(safeText, locatorEvidence(safeText).citations);
       } else {

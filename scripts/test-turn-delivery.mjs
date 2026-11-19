@@ -635,7 +635,14 @@ sys.stdout.buffer.write(data.getvalue())
         assert.notEqual(citationId, wrongId);
         const scopedQuestion = "请查第1轮正式答文引用的是哪个单元格与材料版本，并说明同一材料当前是哪个版本；当前版本无法核实时请明示。";
         const originalSource = `第一轮正式回答引用的是 [${book.material.id}@v1]Model!B2`;
+        const storageNote = match.citations[0].storedFilename ? "，存储文件名 " + match.citations[0].storedFilename : "";
+        const idReport = `第 1 轮回答引用的出处：工作簿 ${filename}，单元格 Model!B2，材料 ID ${book.material.id}，材料版本 v1。\n\n完整 citation.id：${citationId}`;
+        const retryQuestion = `请调用 transcript_search 在本会话第1轮历史中查询“${queries[0]}”。只报告正式回答的出处、材料版本和完整 citation.id。`;
         const cases = [
+          { ending: "裸材料 UUID", answer: `第1轮回答引用的出处是 [${filename}]Model!B2（材料 ${book.material.id}，版本 v1${storageNote}），该命中记录带的完整引用 ID 为 ${citationId}。`, inspect: true },
+          { ending: "单列正确 ID", answer: idReport, inspect: true },
+          { ending: "补齐参数命中后单列 ID", answer: idReport, badArgs: {}, inspect: true },
+          { ending: "未解决另一轮但保留正确 ID", answer: idReport, badArgs: { turn: 2 }, partial: true, inspect: true },
           { ending: "。" },
           { ending: "（材料版本 v1）。", inspect: true },
           { ending: "（材料版本 v2）。", reject: true },
@@ -657,20 +664,26 @@ sys.stdout.buffer.write(data.getvalue())
         ];
         const coldReplies = [];
         coldCases.push({ transport, history, id, materialId: book.material.id, coldReplies });
-        for (const [variant, { ending, answer, inspect, reject, invalid, scoped, read }] of cases.entries()) {
+        for (const [variant, { ending, answer, inspect, reject, invalid, scoped, read, badArgs, partial }] of cases.entries()) {
           await t.test(`reported source ${ending === "。" ? "without version" : ending}${read ? " after workbook_query" : ""}`, async t => {
             const prefix = scoped ? originalSource : source;
             const text = answer ?? prefix + ending;
             const start = branch().length;
             const model = scriptModel(entry, [
+              ...(badArgs ? [{ toolId: `invalid-${variant}`, toolName: "transcript_search", tool: badArgs, stopReason: "toolUse" }] : []),
               { toolId: `version-${variant}`, toolName: "transcript_search", tool: { query: queries[0], turn: 1 }, stopReason: "toolUse" },
               ...(read ? [{ toolId: `current-version-${variant}`, tool: { path: book.path, query: "Model!B2" }, stopReason: "toolUse" }] : []),
               { text, pause: true }, { text },
             ]);
             t.after(model.resume);
-            await ui.send(scoped ? scopedQuestion : question);
+            await ui.send(badArgs ? retryQuestion : scoped ? scopedQuestion : question);
             await bounded(model.paused, "version follow-up did not reach its answer");
             const results = branch().slice(start).map(row => row.message).filter(m => m?.role === "toolResult");
+            if (badArgs) {
+              const invalid = results.shift();
+              assert.equal(invalid.toolName, "transcript_search");
+              assert.equal(invalid.isError, true);
+            }
             assert.deepEqual(results.map(m => m.toolName), read ? ["transcript_search", "workbook_query"] : ["transcript_search"]);
             assert.deepEqual(results[0].details.matches, [match]);
             if (read) assert.ok(results[1].details.citations.some(c => c.materialId === book.material.id &&
@@ -700,7 +713,7 @@ sys.stdout.buffer.write(data.getvalue())
               assert.equal(delivered.text, prefix + "。");
               assert.deepEqual(delivered.citations, first.citations);
             } else {
-              assert.deepEqual([delivered.status, delivered.text, delivered.citations], ["completed", text, first.citations]);
+              assert.deepEqual([delivered.status, delivered.text, delivered.citations], [partial ? "partial" : "completed", text, first.citations]);
             }
             if (inspect || invalid) coldReplies.push({ index, record: delivered });
             assert.deepEqual(branch().slice(start).filter(e => e.customType === "pe_turn_delivery").map(e => e.data), [delivered]);
@@ -710,7 +723,7 @@ sys.stdout.buffer.write(data.getvalue())
               await openOriginalCell(peer.page, await checkReply(peer, delivered, index), book.material.id);
               await ui.reload(id);
               const body = await checkReply(ui, delivered, index);
-              if (answer) assert.equal(await body.locator("[data-cell-cite]").count(), 2);
+              if (ending.startsWith("真实")) assert.equal(await body.locator("[data-cell-cite]").count(), 2);
               await openOriginalCell(ui.page, body, book.material.id);
             }
           });
@@ -734,7 +747,7 @@ sys.stdout.buffer.write(data.getvalue())
       await t.test(`Chrome ${transport} ${history}: exact versioned source after process restart`, async t => {
         const ui = await open(t, transport, origin);
         await ui.select(id);
-        assert.equal(coldReplies.length, 15);
+        assert.equal(coldReplies.length, 19);
         for (const { record, index } of coldReplies) {
           const body = await checkReply(ui, record, index);
           if (record.status === "completed") await openOriginalCell(ui.page, body, materialId);

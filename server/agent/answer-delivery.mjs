@@ -56,6 +56,8 @@ const REPORTED_CELL = /(?:引用|援引|出处|出自|指向|依据|来源|坐�
 const VERSION_LABEL = String.raw`(?:[\da-z_-]+(?:\.[\da-z_-]+)*|[零〇一二两三四五六七八九十百千]+)`;
 const SOURCE_VERSION = new RegExp(String.raw`(?:(?:材料|文件)(?:的)?\s*)?(?:版本(?:号)?|\bversion)\s*(?:为|是)?\s*[:=]?\s*v?\s*(${VERSION_LABEL})|(?:材料|文件)?第\s*(${VERSION_LABEL})\s*版|(?<!\w)@?v(\d+(?:\.\d+)*)\b`, 'gi');
 
+const UUID = String.raw`[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}`;
+const MATERIAL_FIELD = new RegExp(String.raw`(?:材料|文件|material|file)\s*(?:ID\s*(?:为|是)?\s*[:=]?\s*([\w-]+)|(?:为|是)?\s*[:=]?\s*(${UUID})(?![\w-]))`, 'gi');
 const PRESENT = /当前|目前|现在|最新|现行|现为|(?:截至|截止|直至|到)?(?:今天|今日|如今)|\b(?:current(?:ly)?|today|now|latest)\b/i;
 const SOURCE_CLAUSE_BREAK = new RegExp(String.raw`[；;]|[，,](?=\s*(?:而|但)?(?:同一|该|这份)?(?:材料|文件|工作簿)?(?:${PRESENT.source}))`, 'i');
 // Check descriptive fields against the source of the written locator. Keep the
@@ -78,7 +80,7 @@ function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
     if (names.length) {
       const alternatives = names.map(name => name.normalize('NFKC').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
         .sort((a, b) => b.length - a.length).join('|');
-      const nameField = String.raw`(?:(实际存储|存储|实际上传|磁盘|显示|原始)(?:文件)?名(?:称)?|(?:工作簿(?:文件)?|(?:上传)?文件)(?:名(?:称)?)?)\s*(?:为|是|:)?\s*`;
+      const nameField = String.raw`(?:(实际存储|存储|存盘|落盘|实际上传|磁盘|显示|原始)(?:文件)?名(?:称)?|(?:工作簿(?:文件)?|(?:上传)?文件)(?:名(?:称)?)?)\s*(?:为|是|:)?\s*`;
       const ending = String.raw`(?![\w-]|\.[\w.-])`;
       const knownName = String.raw`(?:\[(${alternatives})\]|(${alternatives})${ending})`;
       // At a label, consume the whole written workbook name, including
@@ -89,7 +91,7 @@ function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
         hasFields = true;
         if (otherBracketed || otherPlain) conflict = field;
         else if (kind) {
-          const expected = /存储|上传|磁盘/.test(kind) ? source.storedFilename : source.filename;
+          const expected = /存储|存盘|落盘|上传|磁盘/.test(kind) ? source.storedFilename : source.filename;
           if (expected?.normalize('NFKC') !== (bracketed || plain)) conflict = field;
         }
         return ' ';
@@ -106,9 +108,9 @@ function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
     });
     const otherWorkbook = text.match(/[^\s()[\]，,。；;]+\.xls[xm]\b/i);
     if (otherWorkbook) conflict = otherWorkbook[0];
-    text = text.replace(/(?:材料|文件|material|file)\s*ID\s*(?:为|是)?\s*[:=]?\s*([\w-]+)/gi, (field, id) => {
+    text = text.replace(MATERIAL_FIELD, (field, labeled, uuid) => {
       hasFields = true;
-      if (source?.materialId !== id) conflict = field;
+      if (source?.materialId !== (labeled || uuid)) conflict = field;
       return ' ';
     });
     text = text.replace(SOURCE_VERSION, (field, labeled, numbered, short) => {
@@ -209,7 +211,7 @@ function ordinal(label) {
   return number + digit;
 }
 
-function explicitTurns(text) {
+export function explicitTurns(text) {
   const turns = new Set();
   for (const match of text.matchAll(/第\s*([零一二三四五六七八九十百千\d]+)\s*[轮次]|\bturn\s*#?(\d+)/gi)) {
     turns.add(ordinal(match[1] || match[2]));
@@ -254,6 +256,10 @@ function followingSourceLocator(restOfSentence, parts, nextPart, ids) {
   }
 }
 
+export function asksHistoricalSource(question) {
+  return HISTORY.test(question) && REFERENCE.test(question);
+}
+
 export function reportedLocatorEvidence(text, question, current, matches, workbookEvidence = []) {
   const fallback = { citations: current };
   if (!matches.length && !(HISTORY.test(question) && REFERENCE.test(question))) return fallback;
@@ -261,13 +267,15 @@ export function reportedLocatorEvidence(text, question, current, matches, workbo
   const allowed = matches.filter(match => !requested.size || requested.has(match.turn));
   const used = new Map();
   const bindings = [];
+  const historical = new Map();
   let hasHistoricalLink = false;
   let precedingSource;
   let lastMaterials;
   for (const { parts } of answerBlocks(text)) {
     for (const [partIndex, part] of parts.entries()) {
       const reported = explicitTurns(part);
-      const cells = allowed.filter(match => !reported.size || reported.has(match.turn)).flatMap(match => match.citations);
+      const selected = allowed.filter(match => !reported.size || reported.has(match.turn));
+      const cells = selected.flatMap(match => match.citations);
       const historyLookup = citationLookup(cells);
       const ids = [...cells, ...current];
       const clauses = part.split(SOURCE_CLAUSE_BREAK);
@@ -286,8 +294,15 @@ export function reportedLocatorEvidence(text, question, current, matches, workbo
           // A standalone version or ID may also introduce the next source.
           if (!REFERENCE.test(question)) continue;
           const nextRef = followingSourceLocator(clauses.slice(i + 1).join('；'), parts, partIndex + 1, ids);
-          if (!nextRef) continue;
-          noteSource = resolveLocatorToken(nextRef.raw, historyLookup)?.citation;
+          if (nextRef) noteSource = resolveLocatorToken(nextRef.raw, historyLookup)?.citation;
+          else {
+            // After an intervening heading, a literal citation ID can still
+            // name its source. Never infer an unlabeled version this way.
+            let hasId = false;
+            maskCitationIds(clause, ids, () => { hasId = true; });
+            if (!hasId) continue;
+            if (historical.size === 1) noteSource = historical.values().next().value.citation;
+          }
         }
         const fields = checkSourceFields(clause, refs, fieldLookup, noteSource, ids);
         if (presentVersion && fields.conflict) return { citations: [], conflict: fields.conflict };
@@ -349,7 +364,16 @@ export function reportedLocatorEvidence(text, question, current, matches, workbo
           bindings.push({ raw, identity: citationIdentity(source) });
           lastMaterials.push(source.materialId);
         }
-        for (const cell of adoptedCitations(clause, evidence)) used.set(cell.id, cell);
+        for (const cell of adoptedCitations(clause, evidence)) {
+          used.set(cell.id, cell);
+          if (isReport) {
+            const source = historical.get(cell.id) ?? { citation: cell, turns: new Set() };
+            const owners = new Set(selected.filter(match => match.citations.some(c => c.id === cell.id &&
+              citationIdentity(c) === citationIdentity(cell) && locatorKey(c.locator) === locatorKey(cell.locator))).map(match => match.turn));
+            if (reported.size || owners.size === 1) for (const turn of owners) source.turns.add(turn);
+            historical.set(cell.id, source);
+          }
+        }
         precedingSource = isReport ? fields.lastSource : undefined;
         hasHistoricalLink ||= isReport;
       }
@@ -371,7 +395,7 @@ export function reportedLocatorEvidence(text, question, current, matches, workbo
   maskCitationIds(lastLine, citations, (cell, field) => {
     if (cell && lastLine.endsWith(field) && (field !== cell.id || lastLine.trim() === field)) endsWithIdField = true;
   });
-  return { citations, endsWithIdField };
+  return { citations, endsWithIdField, historical: [...historical.values()] };
 }
 
 export function joinContinuation(prefix, delta) {
@@ -511,19 +535,60 @@ export function blockingFinding(finding) {
   return finding.severity === 'error' || finding.rule === 'unverified_locator';
 }
 
+// Metadata next to a retained historical locator may be a complete field
+// without a sentence terminator. Check every value against that same cell.
+function verifiedSourceNote(part, source, requireId = false) {
+  if (!source || assertsCurrentVersion(part)) return false;
+  const masked = maskCitationIds(part, [source]);
+  if (extractLocatorMatches(masked).length) return false;
+  const fields = checkSourceFields(part, [], null, source, [source]);
+  return fields.hasFields && (!requireId || fields.hasId) && !fields.conflict && !fields.idConflict && sourceFieldsOnly(fields.checked, fields.hasId);
+}
+
 // On exhaustion or interruption only release complete, separately sourced
-// sentences or table rows that pass the same factual checks alone and together.
-export function verifiedPortion(blocks, evidenceFor, findingsFor, coverage) {
+// sentences or table rows and their verified source fields.
+export function verifiedPortion(answer, blocks, reportFor, findingsFor, coverage) {
   const verified = [];
+  const anchors = [];
+  let retainedAll = true;
   for (const { header, parts } of blocks) {
-    const kept = parts.filter(part => {
-      if (coverage.unsupported.has(part) || (coverage.missing.length && !coverage.supported.has(part))) return false;
+    const eligible = part => !coverage.unsupported.has(part) && (!coverage.missing.length || coverage.supported.has(part));
+    const sources = new Map();
+    const kept = parts.map((part, index) => {
+      if (!eligible(part)) return false;
+      const report = reportFor(part);
       const sourced = coverage.verifiedEndings.has(part) ||
-        (/[。！？.!?]$/.test(part) && adoptedCitations(part, evidenceFor(part)).length);
-      return sourced && !findingsFor(part).some(blockingFinding);
+        (/[。！？.!?]$/.test(part) || report.endsWithIdField) && adoptedCitations(part, report.citations).length;
+      if (!sourced || findingsFor(part).some(blockingFinding)) return false;
+      if (report.historical?.length === 1) sources.set(index, report.historical[0].citation);
+      return true;
     });
-    if (kept.length) verified.push([...(header ? [header] : []), ...kept].join('\n'));
+    const render = rows => [...(header ? [header] : []), ...rows].join('\n');
+    const core = parts.filter((_, i) => kept[i]);
+    if (core.length) anchors.push(render(core));
+    if (!header) for (const [index, source] of sources) {
+      for (const step of [-1, 1]) {
+        let adjacent = true;
+        for (let i = index + step; i >= 0 && i < parts.length && !kept[i]; i += step) {
+          if (eligible(parts[i]) && verifiedSourceNote(parts[i], source, !adjacent)) {
+            kept[i] = true;
+            continue;
+          }
+          // An ID names its cell even across an omitted heading or claim.
+          // Do not carry it across another source or a conflicting field.
+          if (sources.size !== 1 || extractLocatorMatches(parts[i]).length ||
+              checkSourceFields(parts[i], [], null, source, [source]).hasFields) break;
+          adjacent = false;
+        }
+      }
+    }
+    retainedAll &&= kept.every(Boolean);
+    const rows = parts.filter((_, i) => kept[i]);
+    if (rows.length) verified.push(render(rows));
   }
-  const body = verified.join('\n\n');
-  return body && !findingsFor(body).some(blockingFinding) ? body : '';
+  const body = retainedAll ? answer : verified.join('\n\n');
+  if (body && !findingsFor(body).some(blockingFinding)) return body;
+  // Combining notes with different anchors may introduce ambiguity.
+  const core = anchors.join('\n\n');
+  return core && core !== body && !findingsFor(core).some(blockingFinding) ? core : '';
 }
