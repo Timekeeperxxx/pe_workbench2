@@ -195,18 +195,18 @@ async function generateAnswer(entry, promptText, options, active) {
       const blocks = answerBlocks(answer);
       const workbookTurn = active.attachments?.some(path => /\.xls[xm]$/i.test(path)) || workbookReads.length > 0;
       const coverage = workbookItemCoverage(text, blocks, workbookEvidence, workbookTurn);
-      const locatorEvidence = candidate => reportedLocatorEvidence(candidate, text, turnCitations, historical);
+      const locatorEvidence = candidate => reportedLocatorEvidence(candidate, text, turnCitations, historical, workbookEvidence);
       const sourceReport = locatorEvidence(answer);
       const available = sourceReport.citations;
       const findingsFor = (candidate, checkContext = lintContext) => {
         const lastLine = candidate.slice(candidate.lastIndexOf('\n') + 1);
-        const endsWithVerifiedValue = coverage.verifiedEndings.has(lastLine);
         const report = candidate === answer ? sourceReport : locatorEvidence(candidate);
+        const verifiedEnding = coverage.verifiedEndings.has(lastLine) || report.endsWithIdField;
         const lint = lintAnswer(candidate, { ...checkContext, locatorCitations: report.citations }).filter(finding =>
-          finding.rule !== 'incomplete' || finding.message !== '句末可能截断' || !endsWithVerifiedValue);
+          finding.rule !== 'incomplete' || finding.message !== '句末可能截断' || !verifiedEnding);
         if (report.conflict) lint.push({
-          rule: 'unverified_locator', severity: 'error', message: '答文注明的材料或版本与历史引用不一致',
-          excerpt: report.conflict, expected: '使用命中的正式答文所引用的材料 ID、版本和单元格',
+          rule: 'unverified_locator', severity: 'error', message: '出处所述材料、版本或引用缺少对应证据',
+          excerpt: report.conflict, expected: '历史出处须与命中的正式答文一致，当前版本须由本轮读取同一材料核实',
         });
         return [
           ...lintFactIdentity(candidate, entry.ctx?.factMemory, { question: text }),

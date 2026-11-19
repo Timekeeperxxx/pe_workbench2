@@ -434,7 +434,7 @@ sys.stdout.buffer.write(data.getvalue())
       [dataset.materialId, dataset.version, dataset.locator]));
     assert.ok(targets.length > 0);
     for (const target of targets) assert.deepEqual(target, [materialId, "1", "Model!B2"]);
-    await body.getByRole("button", { name: `[${filename}]Model!B2`, exact: true }).click();
+    await links.first().click();
     const cell = page.locator('#xlsxSheet .xlsx-c.is-sel[data-r="2"][data-c="2"]');
     await cell.waitFor();
     assert.equal(await cell.innerText(), "317");
@@ -593,6 +593,8 @@ sys.stdout.buffer.write(data.getvalue())
         const citationId = match.citations[0].id;
         const wrongId = citationId.replace(":v1:", ":v2:");
         assert.notEqual(citationId, wrongId);
+        const scopedQuestion = "请查第1轮正式答文引用的是哪个单元格与材料版本，并说明同一材料当前是哪个版本；当前版本无法核实时请明示。";
+        const originalSource = `第一轮正式回答引用的是 [${book.material.id}@v1]Model!B2`;
         const cases = [
           { ending: "。" },
           { ending: "（材料版本 v1）。", inspect: true },
@@ -603,22 +605,31 @@ sys.stdout.buffer.write(data.getvalue())
           { ending: "。当时用的是第二版。", invalid: "第二版" },
           { ending: "（材料第二版）。", reject: true },
           { ending: "。材料版本为 v2。", invalid: "v2" },
+          { ending: `（材料版本 v1，命中所带的完整引用 ID：${citationId}）。`, inspect: true },
+          { ending: "。当前材料版本为 v1。", scoped: true, invalid: "当前材料版本为 v1" },
+          { ending: "。当前材料版本为 v1。", scoped: true, read: true, invalid: "当前材料版本为 v1" },
+          { ending: "。当前材料版本为 v2。", scoped: true, read: true, inspect: true },
         ];
         const coldReplies = [];
         coldCases.push({ transport, history, id, materialId: book.material.id, coldReplies });
-        for (const [variant, { ending, inspect, reject, invalid }] of cases.entries()) {
-          await t.test(`reported source ${ending === "。" ? "without version" : ending}`, async t => {
-            const text = source + ending;
+        for (const [variant, { ending, inspect, reject, invalid, scoped, read }] of cases.entries()) {
+          await t.test(`reported source ${ending === "。" ? "without version" : ending}${read ? " after workbook_query" : ""}`, async t => {
+            const prefix = scoped ? originalSource : source;
+            const text = prefix + ending;
             const start = branch().length;
             const model = scriptModel(entry, [
               { toolId: `version-${variant}`, toolName: "transcript_search", tool: { query: queries[0], turn: 1 }, stopReason: "toolUse" },
+              ...(read ? [{ toolId: `current-version-${variant}`, tool: { path: book.path, query: "Model!B2" }, stopReason: "toolUse" }] : []),
               { text, pause: true }, { text },
             ]);
             t.after(model.resume);
-            await ui.send(question);
+            await ui.send(scoped ? scopedQuestion : question);
             await bounded(model.paused, "version follow-up did not reach its answer");
-            const hit = branch().slice(start).find(row => row.message?.toolName === "transcript_search").message.details;
-            assert.deepEqual(hit.matches, [match]);
+            const results = branch().slice(start).map(row => row.message).filter(m => m?.role === "toolResult");
+            assert.deepEqual(results.map(m => m.toolName), read ? ["transcript_search", "workbook_query"] : ["transcript_search"]);
+            assert.deepEqual(results[0].details.matches, [match]);
+            if (read) assert.ok(results[1].details.citations.some(c => c.materialId === book.material.id &&
+              c.version === 2 && c.locator === "Model!B2" && c.value === 942));
             const pending = entry.postAnswerRun;
             // Keep the sender connected for live delivery. A second browser loses
             // its connection with the answer still pending.
@@ -636,11 +647,12 @@ sys.stdout.buffer.write(data.getvalue())
             if (invalid) {
               assert.ok(!delivered.text.includes(invalid), `unverified source was delivered: ${delivered.text}`);
             }
+            if (scoped && invalid) assert.equal(delivered.status, "partial");
             if (reject || (invalid && delivered.status === "failed")) {
               assert.deepEqual([delivered.status, delivered.text, delivered.citations], ["failed", "", []]);
             } else if (invalid) {
               assert.ok(["partial", "completed"].includes(delivered.status));
-              assert.equal(delivered.text, source + "。");
+              assert.equal(delivered.text, prefix + "。");
               assert.deepEqual(delivered.citations, first.citations);
             } else {
               assert.deepEqual([delivered.status, delivered.text, delivered.citations], ["completed", text, first.citations]);
@@ -666,7 +678,7 @@ sys.stdout.buffer.write(data.getvalue())
       await t.test(`Chrome ${transport} ${history}: exact versioned source after process restart`, async t => {
         const ui = await open(t, transport, origin);
         await ui.select(id);
-        assert.equal(coldReplies.length, 6);
+        assert.equal(coldReplies.length, 10);
         for (const { record, index } of coldReplies) {
           const body = await checkReply(ui, record, index);
           if (record.status === "completed") await openOriginalCell(ui.page, body, materialId);

@@ -168,10 +168,17 @@ export function citationLookup(citations) {
   };
 }
 
+// The Chinese display label and the tool field name can be given together.
+// Both name the same field; only its value is compared to a returned ID.
+const idLabel = String.raw`(?:引用\s*ID|\bcitation[ ._-]*id)`;
+const labelStyle = '[`*\\s]*';
+const alias = `(?:[（(]${labelStyle}${idLabel}${labelStyle}[)）]${labelStyle})?`;
+const idMarker = idLabel + labelStyle + alias + '(?:字段)?(?:为|是)?\\s*[:：=]?\\s*[`*]*';
+
 // A citation ID is opaque metadata. Its embedded Sheet!A1 is not a
 // second, unqualified locator. Keep offsets stable for lint and HTML rendering.
 export function maskCitationIds(text, citations = [], onField) {
-  const marker = /(?:引用\s*ID|\bcitation[ _-]*id)\s*(?:为|是|[:：=])?\s*[`*]*|\b(?:cite|derived):/gi;
+  const marker = new RegExp(idMarker + String.raw`|\b(?:cite|derived):`, 'gi');
   let masked = '';
   let end = 0;
   for (let match; (match = marker.exec(text));) {
