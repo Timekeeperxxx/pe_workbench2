@@ -64,7 +64,7 @@ export function resultText(value) {
 export function toolStatusFromResult(content, isError = false) {
   if (isError) return "error";
   const text = String(content || "").trim();
-  if (/^(?:error|failed|失败)|isError/i.test(text)) return "error";
+  if (/^(?:error|failed|失败|isError)/i.test(text)) return "error";
   return "done";
 }
 

@@ -1,26 +1,22 @@
 import { asLegacyFact, lintFactIdentity } from '../../lib/fact-memory/context.mjs';
 /** Shared user-turn lifecycle. Automated watch/tracking prompts never use this wrapper. */
 import { buildTurnContext, checkTurnTools } from '../../lib/turn-context.mjs';
-import { readLedger } from '../../lib/ledger.mjs';
+import { pendingMerges, readLedger, readLedgerSync } from '../../lib/ledger.mjs';
 import { recordUserClaims } from '../../lib/claim-detect.mjs';
 import { randomUUID } from 'node:crypto';
 import { lintAnswer, lintLedgerAnswer, answerStats, asksDeviationQuestion, contextModelTarget } from '../../lib/answer-lint.mjs';
 import { collectCitationsFromToolCalls, rehydrateCitations } from '../../lib/citations.mjs';
+import { validCitations } from '../../lib/contracts/citation.mjs';
 import { markStaleVersions, registerToolResult } from '../../lib/fact-register.mjs';
-import { textOfContent } from './snapshot.mjs';
+import { frameworkForTurn, textOfContent } from './snapshot.mjs';
 import { indexJson, locateChatTopics, recentTopicDialogue } from './topic-locator.mjs';
 import { updateTopicsFromFacts } from '../../lib/topic-index.mjs';
 
 import { activateQueuedTurn, startTurn, saveTurnDelivery } from './turn-delivery.mjs';
-import { adoptedCitations, answerBlocks, answerGaps, blockingFinding, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
+import { sourceSearchGap } from './transcript-search-recovery.mjs';
+import { adoptedCitations, asksHistoricalSource, answerBlocks, answerGaps, blockingFinding, reportedLocatorEvidence, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
 import { presentUserAnswer } from '../../ui/chat/user-facing-answer.js';
-const CONTEXT_BUDGET_FAILURE = "上下文超限，没有生成回答。";
-
-function isContextBudgetError(errorMessage) {
-  const text = String(errorMessage || "");
-  if (text.includes(CONTEXT_BUDGET_FAILURE)) return true;
-  return /maximum context length|reduce the length of the messages|exceeds the context window/i.test(text);
-}
+import { CONTEXT_BUDGET_FAILURE, isContextBudgetError } from '../../lib/context-budget.mjs';
 
 export function runWithPostAnswer(entry, text, options = {}, broadcast = () => {}) {
   const { runId, attachments, ...promptOptions } = options;
@@ -47,7 +43,17 @@ export function runWithPostAnswer(entry, text, options = {}, broadcast = () => {
     }
     if (active.cancelled) outcome = { ...outcome, status: 'cancelled', reason: '用户已取消本次回答。' };
     try {
-      const record = saveTurnDelivery(entry, { version: 1, turnId: turn.turnId, ...(turn.runId ? { runId: turn.runId } : {}), finishedAt: new Date().toISOString(), ...outcome });
+      const framework = outcome.status === 'completed' || outcome.status === 'partial'
+        ? frameworkForTurn(entry.session, entry.ctx, turn.turnId, active.frameworkEdits)
+        : null;
+      const presentation = framework ? {
+        ...framework,
+        turnStartedAt: turn.startedAt,
+        analysisStatePendingMerge: pendingMerges(readLedgerSync(entry.ctx.root, entry.id))
+          .some(item => item.path === framework.analysisStatePath),
+      } : {};
+      if (!framework && active.frameworkEdits?.size) presentation.analysisState = null;
+      const record = saveTurnDelivery(entry, { version: 1, turnId: turn.turnId, ...(turn.runId ? { runId: turn.runId } : {}), finishedAt: new Date().toISOString(), ...outcome, ...presentation });
       try {
         broadcast({ type: 'turn.delivered', record });
         entry.onTurnDelivered?.(record);
@@ -68,7 +74,6 @@ export function runWithPostAnswer(entry, text, options = {}, broadcast = () => {
       // Snapshot joins (e.g. an unavailable tool-card table) cannot change
       // the already persisted decision returned to the other transport.
       try {
-        broadcast({ type: 'answer.checked' });
         if (entry.snapshot) broadcast(entry.snapshot());
       } catch (error) {
         console.warn('[chat] Could not refresh the session snapshot:', error.message);
@@ -123,7 +128,7 @@ async function generateAnswer(entry, promptText, options, active) {
   };
   const unsubscribe = entry.session.subscribe?.(event => {
     if (event.type === 'message_end' && event.message?.role === 'assistant') latestMessage = event.message;
-    if (event.type === 'tool_execution_start') toolCalls.push({ id: event.toolCallId, name: event.toolName, args: event.args, success: false });
+    if (event.type === 'tool_execution_start') toolCalls.push({ id: event.toolCallId, name: event.toolName, args: event.args, messageIndex: entry.session.messages.length, success: false });
     if (event.type === 'tool_execution_end') {
       const call = toolCalls.findLast(c => c.id === event.toolCallId);
       if (call) {
@@ -161,7 +166,7 @@ async function generateAnswer(entry, promptText, options, active) {
       for (const [index, m] of messages.entries()) for (const c of Array.isArray(m.content) ? m.content : []) {
         if (c.type !== 'toolCall') continue;
         const result = messages.find(r => r.role === 'toolResult' && r.toolCallId === c.id);
-        scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, success: Boolean(result) && result.isError === false, details:result?.details, result });
+        scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, argumentsError: c.argumentsError, success: Boolean(result) && result.isError === false, details:result?.details, result });
       }
       for(const call of scanned) if(call.success) registrationJobs.push(registerToolResult(entry.ctx?.root,entry.id,call,{turn}).catch(()=>[]));
       const registered= (await Promise.all(registrationJobs)).flat().filter(Boolean);
@@ -171,6 +176,11 @@ async function generateAnswer(entry, promptText, options, active) {
         if (call.success) successful.set(call.id, call);
       }
       const thisTurnCitations = collectCitationsFromToolCalls([...successful.values()].reverse());
+      const historical = [...successful.values()].filter(call => call.name === 'transcript_search')
+        .flatMap(call => call.details?.matches || [])
+        .filter(match => match?.role === 'assistant' && Number.isInteger(match.turn))
+        .map(match => ({ turn: match.turn, citations: validCitations(match.citations).filter(cite => cite.version) }));
+
       const currentVersions={...(entry.materialVersions||{})};
       for (const c of thisTurnCitations.toReversed()) if (c.materialId && c.version) currentVersions[c.materialId] = c.version;
       await markStaleVersions(entry.ctx?.root,entry.id,currentVersions).catch(()=>0);
@@ -186,11 +196,19 @@ async function generateAnswer(entry, promptText, options, active) {
       const blocks = answerBlocks(answer);
       const workbookTurn = active.attachments?.some(path => /\.xls[xm]$/i.test(path)) || workbookReads.length > 0;
       const coverage = workbookItemCoverage(text, blocks, workbookEvidence, workbookTurn);
+      const locatorEvidence = candidate => reportedLocatorEvidence(candidate, text, turnCitations, historical, workbookEvidence);
+      const sourceReport = locatorEvidence(answer);
+      const available = sourceReport.citations;
       const findingsFor = (candidate, checkContext = lintContext) => {
         const lastLine = candidate.slice(candidate.lastIndexOf('\n') + 1);
-        const endsWithVerifiedValue = coverage.verifiedEndings.has(lastLine);
-        const lint = lintAnswer(candidate, checkContext).filter(finding =>
-          finding.rule !== 'incomplete' || finding.message !== '句末可能截断' || !endsWithVerifiedValue);
+        const report = candidate === answer ? sourceReport : locatorEvidence(candidate);
+        const verifiedEnding = coverage.verifiedEndings.has(lastLine) || report.endsWithIdField || report.endsWithNoGaps;
+        const lint = lintAnswer(candidate, { ...checkContext, locatorCitations: report.citations }).filter(finding =>
+          finding.rule !== 'incomplete' || finding.message !== '句末可能截断' || !verifiedEnding);
+        if (report.conflict) lint.push({
+          rule: 'unverified_locator', severity: 'error', message: '出处所述材料、版本或引用缺少对应证据',
+          excerpt: report.conflict, expected: '历史出处须与命中的正式答文一致，当前版本须由本轮读取同一材料核实',
+        });
         return [
           ...lintFactIdentity(candidate, entry.ctx?.factMemory, { question: text }),
           ...lint,
@@ -201,12 +219,13 @@ async function generateAnswer(entry, promptText, options, active) {
         ];
       };
       const findings = findingsFor(answer);
-      const adopted = adoptedCitations(answer, turnCitations);
+      const adopted = adoptedCitations(answer, available);
       const adoptedIds = new Set([...adopted.map(citation => citation.id), ...coverage.evidenceIds]);
       const candidateCalls = [...scanned.filter(call => call.messageIndex >= candidateMessageStart), ...toolCalls.slice(candidateCallStart)];
       const lastVerifiedRead = candidateCalls.findLastIndex(call => call.name === 'workbook_query' && call.success &&
         collectCitationsFromToolCalls([call]).some(citation => adoptedIds.has(citation.id)));
       for (const gap of new Set([...answerGaps(answer), ...coverage.missing])) {
+        if (gap === '无' && sourceReport.endsWithNoGaps) continue;
         findings.push({ rule: 'delivery_gap', severity: 'error', message: `未核验：${gap}`, excerpt: gap });
       }
       if (message.stopReason === 'length' && !findings.some(f => f.rule === 'incomplete')) {
@@ -216,7 +235,7 @@ async function generateAnswer(entry, promptText, options, active) {
       const data = {
         version: 1, turnId, timestamp: new Date().toISOString(),
         findings, stats: answerStats(answer), correctionCount, continuationCount,
-        citations: turnCitations,
+        citations: available,
         messageIndex: entry.session.messages.lastIndexOf(message),
       };
       // Custom entries are durable metadata, never model-visible chat messages.
@@ -230,13 +249,17 @@ async function generateAnswer(entry, promptText, options, active) {
       // toward recovery if the final answer actually cites its evidence.
       const latestTools = new Map();
       for (const call of candidateCalls) latestTools.set(call.name + JSON.stringify(call.args || {}), call);
+      const sourceQuestion = asksHistoricalSource(text);
+      const searchGap = sourceQuestion && sourceSearchGap(text, answer, scanned, toolCalls, sourceReport.historical, blocks, coverage,
+        clause => Boolean(locatorEvidence(clause).historical?.length) && !findingsFor(clause).some(blockingFinding));
       const failedTool = [...latestTools.values()].find(call => !call.success &&
+        !(sourceQuestion && call.name === 'transcript_search') &&
         (call.name !== 'workbook_query' || candidateCalls.lastIndexOf(call) >= lastVerifiedRead));
-      const toolGap = failedTool ? `工具 ${failedTool.name} 执行失败。` : '';
+      const toolGap = [searchGap, failedTool && `工具 ${failedTool.name} 执行失败。`].filter(Boolean).join('；');
       if (blocking.length || !answer || toolGap) {
-        safeText = verifiedPortion(blocks, turnCitations,
+        safeText = verifiedPortion(answer, blocks, locatorEvidence,
           part => findingsFor(part, { ...lintContext, requiredSections: [] }), coverage);
-        safeCitations = adoptedCitations(safeText, turnCitations);
+        safeCitations = adoptedCitations(safeText, locatorEvidence(safeText).citations);
       } else {
         return { status: 'completed', text: answer, citations: adopted };
       }

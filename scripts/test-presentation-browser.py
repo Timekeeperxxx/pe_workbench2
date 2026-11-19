@@ -23,10 +23,13 @@ with sync_playwright() as pw:
     const host=document.createElement('div');host.innerHTML=html;
     const raw=Array.from({length:6},()=>'<span class="hl-review evil" style="color:red" onclick="alert(1)">核时点</span>').join('');
     const clean=sanitizeMarkdown(raw,{}); const box=document.createElement('div');box.innerHTML=clean;
-    return {html,collapsed:host.querySelector('[data-report-toggle]').getAttribute('aria-expanded')==='false',clean,count:box.querySelectorAll('.hl-review').length,labels:box.textContent.includes('需复核：'),unsafe:!!box.querySelector('[style],[onclick],.evil')};
+    const body=host.querySelector('.msg-body');
+    const card=body.nextElementSibling;
+    return {html,body:body.textContent.trim(),cardFollowsBody:card.matches('.framework-presentation'),collapsed:host.querySelector('[data-report-toggle]').getAttribute('aria-expanded')==='false',clean,count:box.querySelectorAll('.hl-review').length,labels:box.textContent.includes('需复核：'),unsafe:!!box.querySelector('[style],[onclick],.evil')};
   }''')
   assert data['collapsed']
-  assert '旧回复' not in data['html']
+  assert data['body']=='旧回复'
+  assert data['cardFollowsBody']
   assert '核时点' in data['html']
   assert not data['unsafe']
   assert data['count']==4,data

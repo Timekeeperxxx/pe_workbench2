@@ -1,9 +1,8 @@
 # AG-UI 协议适配层（Pi Agent → AG-UI）
 
-> 范围：协议、事件日志、断线重放、兼容接口。
-> 非范围：投研领域逻辑（materials / tracking / plans / workbook / PDF / ASR / model writer）与现有前端渲染。`app.js`、`index.html`、`styles.css` 均未改动。
+本文说明用户聊天的交付记录、默认 SSE、AG-UI 事件和断线重放。
 
-## 1. 事实源不变
+## 1. 会话与事件的存储
 
 | 数据 | 事实源 | 说明 |
 |---|---|---|
@@ -13,11 +12,44 @@
 
 `agent_events` 只记录 AG-UI 传输事件；material / tracking / plan / notification 等领域事件不会写入。
 
-### 用户回合的持久化结果
 
-用户回合在校验、纠错或续写结束后，将一条 `pe_turn_delivery` 自定义记录写入当前 Pi 会话分支。记录包含 `version`、`turnId`、`finishedAt`、`text`、实际采用的 `citations` 和 `status`。关联 AG-UI 运行时包含 `runId`。状态为 `partial`、`failed` 或 `cancelled` 时，`reason` 说明缺口或终止原因。`completed` 表示本轮已经交付完整正文。
+### 用户聊天的持久记录
 
-同一 `turnId` 的首次终态记录生效。会话恢复时，服务端从活动分支读回该记录；已经开始却没有终态记录的回合恢复为失败。会话快照采用已交付的正文和引用，旧会话继续从原始消息重建。运行 `npm run test:turn-delivery` 可验证落盘、重试、恢复及工作簿多指标交付。
+同一条用户消息从首答、工具调用、整篇纠错到断点续写共用一个 `turnId`。Pi 会话的当前分支保存以下自定义条目。
+
+| 条目 | 内容和写入时机 |
+|---|---|
+| `pe_turn_started` | 接受用户消息时记录 `turnId`、`question`、`startedAt`。排队的回合用 `queued` 标记，开始执行时追加 `pe_turn_active`，以便将原始消息归入对应回合。 |
+| `pe_answer_lint` | 每次检查完整候选正文时记录发现、候选证据和补救次数，供执行记录读取。 |
+| `pe_turn_delivery` | 收口时一次写入 `version: 1`、`turnId`、`text`、`citations`、`status`、`finishedAt`，有缺口或异常时另存 `reason`。AG-UI 回合另存传输用的 `runId`。同一回合再次收口时读取首次保存的记录。 |
+
+纠错可整篇替换一次。达到输出上限或文本检查发现截断时，可续写一次，服务端保留前缀并对拼接后的全文重新核验。`citations` 保存最终正文实际引用的单元格，工具产生的其他引用随工具过程保存。
+
+| `status` | 交付语义 |
+|---|---|
+| `completed` | 正文通过本轮交付检查。 |
+| `partial` | 只发布能单独复核的完整句，并说明剩余缺口。 |
+| `failed` | 正文为空，`reason` 给出失败原因。 |
+| `cancelled` | 用户取消。可以保留此前通过独立核验的部分。 |
+
+默认 SSE 先发送 `turn.started`，实时发送带 `turnId` 的工具事件，再从持久记录发布 `turn.delivered {record}`。`GET /api/sessions/:id/state` 与默认 SSE 的重连首帧使用同一快照。每条新回答包含 `turnId`、`text`、`citations` 和 `status`。核验期间状态为 `pending`，已完成的工具可展开。前端按 `turnId` 合并完成事件、刷新结果和断线重放。
+
+`turnTimeline(session)` 读取 Pi 当前分支，供快照与 `transcript_search` 共同投影。旧会话按已有停止消息和工具过程重建答案与引用，混合会话逐回合选择读取方式。重新打开已落盘但未收口的回合时，服务记录中断原因。若进程在保存交付之后、写完协议终态之前中断，AG-UI 重连按该记录补齐缺失事件并保留已有游标。运行 `npm run test:turn-delivery` 可验证该契约。
+
+### 第一轮验收复现
+
+在仓库根目录运行 `npm run test:turn-delivery`。端到端用例使用真实 Pi SDK、临时项目与 SQLite，并脚本化模型输出和断线时机。
+
+| Issue | 验收场景 | 脚本 |
+|---|---|---|
+| #10 | 错误引用的 A 被 B 替换，只保留 B 的引用，包含同一坐标来自不同工作簿的情况 | `scripts/test-post-answer.mjs` |
+| #10 | 长度上限、正常停止后不完整、跨断点数值错误、带空格及重复前缀的续写 | `scripts/test-post-answer.mjs` |
+| #10 | 两项预算、部分交付、工具或模型失败、取消、空续写 | `scripts/test-post-answer.mjs` |
+| #10 | 重复收口、暂时写盘失败、模型请求前中断、新进程打开原文件 | `scripts/test-post-answer.mjs` |
+| #13 | 默认 SSE 与 AG-UI 的纠错和两类续写、核验中断线、按游标重放、排队与冷启动 | `scripts/test-turn-delivery.mjs` |
+| #13 | 界面四种终态、正文引用、展开工具、重放与旧快照迟到、CopilotKit 最终快照请求失败 | `scripts/test-turn-delivery-ui.mjs` |
+| #13 | 终态写入中断、协议尾帧按游标恢复、工具进度跨分页 | `scripts/test-agui-delivery-recovery.mjs` |
+| #13 | 新旧回合混合、旧会话引用、工具过程、历史只命中已交付正文、当前回合的检索边界 | `scripts/test-presentation-snapshot.mjs`、`scripts/test-transcript-search.mjs`、`scripts/test-f5-session.mjs` |
 
 ## 2. 标识规范（`lib/agent-protocol/ids.mjs`）
 
@@ -25,7 +57,7 @@
 |---|---|
 | `threadId` | Pi `sessionId`（稳定不变） |
 | `runId` | 每次 prompt 前生成（`run_<uuid>`） |
-| `messageId` | 优先 Pi 消息自带的 `id`（当前 `AssistantMessage` 没有该字段，因此实际走生成路径），否则生成 `msg_<uuid>` |
+| `messageId` | 用户聊天的最终正文使用 `turnId`。独立 Pi 适配器使用 Pi 消息 ID 或生成的 `msg_<uuid>`。 |
 | `toolCallId` | Pi `toolCallId` |
 | `eventId` | `evt_<runId>_<sequence 补零>`，随行持久化，重放不变 |
 | `sequence` | 每个 run 从 1 开始严格递增，`unique(run_id, sequence)` 兜底 |
@@ -33,22 +65,17 @@
 
 ## 3. 事件映射（`pi-ag-ui-adapter.mjs`）
 
-| Pi 事件 | AG-UI 事件 | 备注 |
-|---|---|---|
-| `agent_start` | `RUN_STARTED` | 每个 run 的第一个业务事件 |
-| assistant 首个 `text_delta` 前 | `TEXT_MESSAGE_START` | 懒启动，role = `assistant` |
-| `message_update.text_delta` | `TEXT_MESSAGE_CONTENT` | 只转发文本增量（thinking 不转发） |
-| assistant `message_end` | `TEXT_MESSAGE_END` | 无增量时用最终 content 补发一次 |
-| `tool_execution_start` | `TOOL_CALL_START` + `TOOL_CALL_ARGS` | args 为 JSON 字符串 |
-| `tool_execution_update` | `CUSTOM`（`pi.tool_progress`） | 不干扰标准工具事件；`value.content` 是**累计快照**，不是 delta |
-| `tool_execution_end` | `TOOL_CALL_END` + `TOOL_CALL_RESULT` | 顺序固定；失败结果的标准 `content` 以 `Error:` 开头，`isError` 为兼容扩展字段 |
-| `agent_settled` | `RUN_FINISHED` | 关闭未闭合消息/工具后再发 |
-| prompt 异常 / 适配器异常 / `stopReason: "error"` | `RUN_ERROR` | 同样先补齐未闭合项 |
-| abort | `RUN_FINISHED`（`result.aborted = true`） | 之后的事件一律丢弃 |
+| 事件来源 | 用户聊天的 AG-UI 事件 |
+|---|---|
+| 首次 `agent_start` | `RUN_STARTED`。若提前失败，在发布失败记录前补发开始事件。 |
+| 工具开始、更新、结束 | `TOOL_CALL_START/ARGS`、`CUSTOM pi.tool_progress`、`TOOL_CALL_END/RESULT`。进度是累计快照，失败的工具结果以 `Error:` 开头。 |
+| Pi 正文增量、单次生成结束 | 候选答文保存在 Pi 执行记录中，核验继续。 |
+| 保存交付记录 | 有正文时发布一组 `TEXT_MESSAGE_START/CONTENT/END`。所有状态均发布 `CUSTOM pe.turn_delivery`，其 `value` 是完整持久记录。 |
+| 完成、部分完成 | `RUN_FINISHED` |
+| 用户取消 | `RUN_FINISHED`，含 `result.aborted = true` |
+| 交付失败 | `RUN_ERROR`，含失败原因 |
 
-`agent_end`、`turn_*`、`compaction_*`、`queue_update` 不进入 AG-UI；它们仍走旧 SSE。
-
-**扩展字段**：`TOOL_CALL_RESULT.isError`（AG-UI 原生没有工具错误位）；`RUN_FINISHED.result.aborted`。标准消费者可能丢弃扩展字段，因此失败结果同时通过 `content: "Error: ..."` 保留错误语义。
+独立使用适配器、直接调用 Pi 的会话仍按原始生成的 delta、message_end 和 agent_settled 转发文本和终态。
 
 ## 4. 状态机（`run-state-machine.mjs`）
 

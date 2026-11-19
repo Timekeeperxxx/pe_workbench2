@@ -5,8 +5,13 @@
  */
 
 import path from "node:path";
+import {toolDisplayOutput} from "../../lib/tool-display-output.mjs";
+import {applyPatch} from "diff";
 import {turnTimeline} from "./turn-delivery.mjs";
+import {adoptedCitations, joinContinuation} from "./answer-delivery.mjs";
 import {readLedgerSync, pendingMerges} from "../../lib/ledger.mjs";
+import {CONTEXT_BUDGET_FAILURE, isContextBudgetError} from "../../lib/context-budget.mjs";
+import {presentUserAnswer} from "../../ui/chat/user-facing-answer.js";
 
 export function textOfContent(content) {
   if (typeof content === "string") return content;
@@ -84,8 +89,10 @@ export function makeTitle(text) {
 
 // Pi may compact its model context. History walks the active session branch
 // (including custom lifecycle entries) instead of indexing session.messages.
-function conversationTurns(session) {
+function conversationTurns(session, {beforeTurnId, legacyBoundary} = {}) {
   const timeline = turnTimeline(session);
+  const boundary = legacyBoundary != null && !timeline.some(item => item.kind === "start") ? legacyBoundary : Infinity;
+  let rawIndex = 0;
   const turns = [];
   const managed = new Map();
   let current;
@@ -104,7 +111,11 @@ function conversationTurns(session) {
     } else if (item.kind === "lint") {
       if (current && !current.start) current.lint = item.data;
     } else if (item.kind === "message") {
+      if (rawIndex++ >= boundary) break;
       const { message } = item;
+      if (current && !current.start && ["pe_answer_continue", "pe_answer_correct"].includes(message.customType)) {
+        (current.revisions ??= []).push({ index: current.messages.length, type: message.customType });
+      }
       if (message.peInternal || message.customType || message.role === "custom") continue;
       if (message.role === "user") {
         if (!current?.start || current.user || current.delivery) {
@@ -121,7 +132,8 @@ function conversationTurns(session) {
       }
     }
   }
-  return turns;
+  const before = managed.get(beforeTurnId);
+  return before ? turns.slice(0, turns.indexOf(before)) : turns;
 }
 
 function userMessage(turn) {
@@ -144,35 +156,81 @@ export function lastAssistantText(session) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message.role !== "assistant") continue;
-    const text = textOfContent(message.content).trim();
+    const text = presentUserAnswer(textOfContent(message.content));
     if (text) return text;
   }
   return "";
 }
 
-// Older sessions put text before the last tool in the process view and
-// join subsequent text as the answer, including historical continuations.
-function legacyAnswer(turn) {
+// Sessions predating delivery records retain their last stopped answer and
+// result cards. Their lint metadata, when present, includes citation identities
+// that may have come from a prior verified fact rather than this turn's tools.
+function legacySegment(messages, allowProcessFallback) {
+  let answer = "";
+  let final = [];
   const process = [];
-  const final = [];
-  for (const message of turn.messages) {
+  const errors = [];
+  const lastAssistant = messages.findLast(message => message.role === "assistant");
+  for (const message of messages) {
     if (message.role !== "assistant") continue;
-    const text = textOfContent(message.content).trim();
-    if (text) final.push(text);
+    const text = textOfContent(message.content);
+    if (message === lastAssistant && message.stopReason === "aborted") {
+      return { text, processText: process.join("\n\n").trim(), status: "cancelled" };
+    }
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
+      if (text.trim()) process.push(text);
+      if (message.stopReason === "error") errors.push(message.errorMessage || "");
+      continue;
+    }
+    if (text.trim() && message.stopReason === "stop") answer = text;
+    else if (text.trim()) final.push(text);
     if (Array.isArray(message.content) && message.content.some(block => block.type === "toolCall")) {
-      process.push(...final.splice(0));
+      process.push(...final);
+      final = [];
     }
   }
-  if (!final.length && process.length) {
-    const parts = process.join("\n\n").split("\n\n");
-    return { text: parts.pop(), processText: parts.join("\n\n").trim() };
+  let text = answer || final.join("\n\n");
+  let processText = process.join("\n\n").trim();
+  if (!text.trim() && processText && allowProcessFallback && !errors.length) {
+    const parts = processText.split("\n\n");
+    text = parts.pop() || "";
+    processText = parts.join("\n\n").trim();
   }
-  return { text: final.join("\n\n"), processText: process.join("\n\n") };
+  if (!answer && !text && errors.length) {
+    const budget = errors.some(isContextBudgetError);
+    const detail = budget ? CONTEXT_BUDGET_FAILURE : "没有生成回答。";
+    return { text: detail, processText, failure: { code: budget ? "context_budget" : "request_failed", detail } };
+  }
+  return { text, processText };
 }
 
-function answerMessage(turn) {
+function legacyAnswer(turn, allowProcessFallback) {
+  if (!turn.revisions?.length) {
+    const answer = legacySegment(turn.messages, allowProcessFallback);
+    return answer.status === "cancelled" ? answer : { ...answer, text: presentUserAnswer(answer.text) };
+  }
+  let text = "";
+  const process = [];
+  const phases = [{ index: 0 }, ...turn.revisions];
+  let segment;
+  for (const [i, phase] of phases.entries()) {
+    segment = legacySegment(turn.messages.slice(phase.index, phases[i + 1]?.index));
+    if (phase.type === "pe_answer_correct") {
+      if (text) process.push(text);
+      text = "";
+    }
+    if (segment.processText) process.push(segment.processText);
+    if (!segment.failure && segment.text) text = joinContinuation(text, segment.text);
+  }
+  const processText = process.join("\n\n").trim();
+  if (segment.status === "cancelled") return { text, processText, status: segment.status };
+  if (!text && segment.failure) return { ...segment, processText };
+  return { text: presentUserAnswer(text), processText };
+}
+
+function answerMessage(turn, { allowProcessFallback = true } = {}) {
   const { start, delivery } = turn;
-  if (!start) return legacyAnswer(turn);
+  if (!start) return legacyAnswer(turn, allowProcessFallback);
   return {
     turnId: start.turnId,
     text: delivery?.text ?? "",
@@ -183,18 +241,146 @@ function answerMessage(turn) {
   };
 }
 
+function toolCitationIndex(ctx, threadId) {
+  return new Map((threadId ? ctx?.store?.listToolCitations?.({ threadId }) || [] : [])
+    .filter(record => Array.isArray(record.citations) && record.citations.length)
+    .map(record => [record.toolCallId, record.citations]));
+}
+
+function legacyAnswerCitations(turn, text, tools, onlyAdopted = turn.revisions?.length) {
+  const byId = new Map();
+  for (const cite of [...(turn.lint?.citations || []), ...tools]) {
+    if (!byId.has(cite.id)) byId.set(cite.id, cite);
+  }
+  const candidates = [...byId.values()];
+  return onlyAdopted ? adoptedCitations(text, candidates) : candidates;
+}
+
+// Shape expected by transcript_search. Do not expose tool output or internal
+// prompts through that tool, including when called during verification.
+export function transcriptMessages(session, ctx, options = {}) {
+  const out = [];
+  let citationsByCall;
+  for (const turn of conversationTurns(session, options)) {
+    if (turn.start && !turn.delivery) continue;
+    const user = userMessage(turn);
+    if (user) out.push({ role: "user", content: user.text, timestamp: user.timestamp });
+    const answer = answerMessage(turn, { allowProcessFallback: false });
+    if (!answer.text || answer.failure || (!turn.start && answer.status === "cancelled")) continue;
+    if (!turn.start) {
+      citationsByCall ??= toolCitationIndex(ctx, session.sessionId);
+      answer.citations = legacyAnswerCitations(turn, answer.text, turn.messages.flatMap(m =>
+        m.role === "toolResult" && !m.isError ? citationsByCall.get(m.toolCallId) ?? m.details?.citations ?? [] : []), true);
+    }
+    out.push({
+      role: "assistant", content: answer.text,
+      timestamp: turn.delivery?.finishedAt ?? turn.messages.findLast(m => m.role === "assistant")?.timestamp,
+      ...(answer.citations?.length ? { citations: answer.citations } : {}),
+    });
+  }
+  return out;
+}
+
+export function frameworkStatePath(ctx, value) {
+  if (typeof value !== "string") return "";
+  // Pi accepts an @ prefix on file tool paths.
+  const normalized = shortPath(ctx, value.replace(/^@/, ""));
+  return /(?:^|\/)analysis-state\.json$/.test(normalized) ? normalized : "";
+}
+
+// Replay the file as it was in the turn. A read can seed edits, but only
+// successful writes and edits attach a card to the answer.
+function replayFrameworkTool(ctx, block, result, stateContents, current, capturedEdit) {
+  if (!result || result.isError || !["read", "write", "edit"].includes(block.name)) return;
+  const args = block.arguments || {};
+  const statePath = frameworkStatePath(ctx, args.path);
+  if (statePath) {
+    if (block.name === "read") {
+      // Successful full reads provide an immutable baseline in a new session.
+      // Partial/truncated reads must not be mistaken for a complete state.
+      const readContent = resultText(result);
+      try {
+        const parsed = JSON.parse(readContent);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) stateContents.set(statePath, readContent);
+      } catch { /* no usable baseline */ }
+    }
+    let content = stateContents.get(statePath);
+    if (block.name === "write" && typeof args.content === "string") content = args.content;
+    else if (block.name === "edit" && capturedEdit !== undefined) content = capturedEdit.replace(/^\uFEFF/, "");
+    else if (block.name === "edit" && typeof result.details?.patch === "string") {
+      try {
+        // Pi's patch encodes the actual edits, including fuzzy matches and
+        // replacements that were all resolved against the original text.
+        content = typeof content === "string" ? applyPatch(content, result.details.patch) : undefined;
+      } catch { content = undefined; }
+    } else if (block.name === "edit") {
+      if (typeof content === "string") {
+        const patches = Array.isArray(args.edits)
+          ? args.edits
+          : (typeof args.oldText === "string"
+            ? [{ oldText: args.oldText, newText: args.newText ?? "" }]
+            : null);
+        if (patches?.length) {
+          let next = content;
+          let ok = true;
+          for (const patch of patches) {
+            if (!patch || typeof patch.oldText !== "string" || next.split(patch.oldText).length !== 2) {
+              ok = false;
+              break;
+            }
+            next = next.replace(patch.oldText, () => patch.newText ?? "");
+          }
+          content = ok ? next : undefined;
+        } else content = undefined;
+      } else content = undefined;
+    }
+    if (["write", "edit"].includes(block.name)) {
+      stateContents.delete(statePath);
+      delete current.analysisState;
+      if (typeof content === "string") {
+        stateContents.set(statePath, content);
+        try {
+          const parsed = JSON.parse(content);
+          if (typeof parsed?.presentation?.verdict?.text === "string" && parsed.presentation.verdict.text.trim()) {
+            current.analysisState = parsed;
+            current.analysisStatePath = statePath;
+          }
+        } catch { /* malformed writes fall back to the assistant's text */ }
+      }
+    }
+  }
+}
+
+function toolMessages(turn) {
+  return {
+    results: new Map(turn.messages.filter(m => m.role === "toolResult").map(m => [m.toolCallId, m])),
+    calls: turn.messages.flatMap(m => m.role === "assistant" && Array.isArray(m.content)
+      ? m.content.filter(block => block.type === "toolCall") : []),
+  };
+}
+
+export function frameworkForTurn(session, ctx, turnId, frameworkEdits) {
+  const stateContents = new Map();
+  for (const turn of conversationTurns(session)) {
+    const current = {};
+    const { results, calls } = toolMessages(turn);
+    const delivering = turn.start?.turnId === turnId;
+    for (const call of calls) {
+      const captured = delivering ? frameworkEdits?.get(call.id) : undefined;
+      replayFrameworkTool(ctx, call, results.get(call.id), stateContents, current, captured);
+    }
+    if (delivering) return current.analysisState ? current : null;
+  }
+  return null;
+}
+
 export function snapshotMessages(session, ctx, entry = null) {
   const turns = conversationTurns(session);
   const presentations = new Map();
-  const citationsByCall = new Map();
+  const citationsByCall = entry ? toolCitationIndex(ctx, entry.id) : new Map();
   if (entry) {
     for (const record of ctx.store.listToolPresentations({ threadId: entry.id })) {
       presentations.set(record.toolCallId, record);
-    }
-    for (const record of ctx.store.listToolCitations?.({ threadId: entry.id }) || []) {
-      if (Array.isArray(record.citations) && record.citations.length) {
-        citationsByCall.set(record.toolCallId, record.citations);
-      }
     }
   }
   const stateContents = new Map(); // reconstructed successful writes/edits, never current disk state
@@ -206,9 +392,7 @@ export function snapshotMessages(session, ctx, entry = null) {
       out.push({ ...message, time: hm(timestamp) });
     }
     const current = { tools: [] };
-    const results = new Map(turn.messages.filter(m => m.role === "toolResult").map(m => [m.toolCallId, m]));
-    const calls = turn.messages.flatMap(m => m.role === "assistant" && Array.isArray(m.content)
-      ? m.content.filter(block => block.type === "toolCall") : []);
+    const { results, calls } = toolMessages(turn);
     for (const block of calls) {
       const result = results.get(block.id);
       const record = presentations.get(block.id);
@@ -224,77 +408,36 @@ export function snapshotMessages(session, ctx, entry = null) {
         : record?.schemaName === "presentation.error"
           ? String(record.payload?.error || "工具结果展示数据不可用")
           : "";
-      const args = block.arguments || {};
-      const statePath = shortPath(ctx, args.path || "");
-      if (result && !result.isError && /(?:^|\/)analysis-state\.json$/.test(statePath)) {
-        if (block.name === "read") {
-          // Successful full reads provide an immutable baseline in a new session.
-          // Partial/truncated reads must not be mistaken for a complete state.
-          const readContent = resultText(result);
-          try {
-            const parsed = JSON.parse(readContent);
-            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) stateContents.set(statePath, readContent);
-          } catch { /* no usable baseline */ }
-        }
-        let content = stateContents.get(statePath);
-        if (block.name === "write" && typeof args.content === "string") content = args.content;
-        else if (block.name === "edit") {
-          if (typeof content === "string") {
-            const patches = Array.isArray(args.edits)
-              ? args.edits
-              : (typeof args.oldText === "string"
-                ? [{ oldText: args.oldText, newText: args.newText ?? "" }]
-                : null);
-            if (patches?.length) {
-              let next = content;
-              let ok = true;
-              for (const patch of patches) {
-                if (!patch || typeof patch.oldText !== "string" || next.split(patch.oldText).length !== 2) {
-                  ok = false;
-                  break;
-                }
-                next = next.replace(patch.oldText, () => patch.newText ?? "");
-              }
-              content = ok ? next : undefined;
-            } else content = undefined;
-          } else content = undefined;
-        }
-        if (["write", "edit"].includes(block.name)) {
-          stateContents.delete(statePath);
-          delete current.analysisState;
-          if (typeof content === "string") {
-            stateContents.set(statePath, content);
-            try {
-              const parsed = JSON.parse(content);
-              if (parsed?.presentation) { current.analysisState = parsed; current.analysisStatePath = statePath; }
-            } catch { /* malformed writes fall back to the assistant's text */ }
-          }
-        }
-      }
+      replayFrameworkTool(ctx, block, result, stateContents, current);
       const citations = citationsByCall.get(block.id) ?? result?.details?.citations ?? [];
       current.tools.push({
         id: block.id,
         name: block.name,
         detail: toolDetail(ctx, block.name, block.arguments || {}),
         status: result ? (result.isError ? "error" : "done") : !turn.start ? "done" : turn.delivery ? "error" : "running",
-        output: result ? resultText(result).slice(0, 4000) : "",
+        output: result ? toolDisplayOutput(block.name, result, resultText(result)) : "",
         ...(citations.length ? { citations } : {}),
         ...(presentation ? { presentation } : {}),
         ...(presentationError ? { presentationError } : {}),
       });
     }
     const answer = answerMessage(turn);
-    if (turn.start || answer.text || answer.processText || current.tools.length || current.analysisState) {
+    // A captured edit may have no valid verdict. Only older records without
+    // a saved decision about the card should fall back to tool replay.
+    if (turn.delivery?.analysisState === null) {
+      delete current.analysisState;
+      delete current.analysisStatePath;
+    }
+    if (turn.start || answer.text || answer.status || answer.processText || current.tools.length || current.analysisState) {
       const firstAssistant = turn.messages.find(m => m.role === "assistant");
-      const legacyCitations = new Map();
-      if (!turn.start) {
-        for (const cite of [...(turn.lint?.citations || []), ...current.tools.flatMap(tool => tool.citations || [])]) {
-          if (!legacyCitations.has(cite.id)) legacyCitations.set(cite.id, cite);
-        }
-      }
+      const legacyCitations = turn.start ? [] : legacyAnswerCitations(turn, answer.text, current.tools.flatMap(tool => tool.citations || []));
       out.push({
         role: "assistant", ...current, ...answer,
-        ...(legacyCitations.size ? { citations: [...legacyCitations.values()] } : {}),
+        ...(turn.delivery?.analysisState ? {
+          analysisState: turn.delivery.analysisState, analysisStatePath: turn.delivery.analysisStatePath,
+          analysisStatePendingMerge: turn.delivery.analysisStatePendingMerge === true,
+        } : {}),
+        ...(turn.revisions?.length || legacyCitations.length ? { citations: legacyCitations } : {}),
         time: hm(turn.delivery?.finishedAt ?? firstAssistant?.timestamp ?? user?.timestamp),
         turnStartedAt: user?.timestamp ?? firstAssistant?.timestamp,
       });

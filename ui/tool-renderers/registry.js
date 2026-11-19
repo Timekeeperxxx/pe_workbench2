@@ -7,6 +7,8 @@
  * throwing into the message renderer.
  */
 
+import { citationButton } from "../chat/cell-citations.js";
+import { normalizeLocator } from "../chat/citation-locator.js";
 import { esc, safeText } from "../shared/escape.js";
 import {
   validateProposalPayload,
@@ -81,7 +83,11 @@ export function errorCardHTML(message, { title = "无法展示这个工具结果
 export function renderToolPresentation(tool, context = {}) {
   const presentation = tool?.presentation;
   if (tool?.presentationError) return errorCardHTML(tool.presentationError);
-  if (!presentation?.schema?.name) return "";
+  if (!presentation?.schema?.name) {
+    return tool?.name === "transcript_search" && tool.status === "done" && tool.output
+      ? transcriptSearchCardHTML(tool)
+      : "";
+  }
   const renderer = getRenderer(presentation.schema.name, Number(presentation.schema.version || 1));
   if (!renderer) {
     return errorCardHTML(
@@ -96,6 +102,39 @@ export function renderToolPresentation(tool, context = {}) {
   } catch (error) {
     return errorCardHTML(`渲染失败：${error.message || error}`);
   }
+}
+
+/* ---------- conversation history ---------- */
+
+function transcriptSearchCardHTML(tool) {
+  let result;
+  try { result = JSON.parse(tool.output); } catch { /* older partial results can be truncated */ }
+  if (!Array.isArray(result?.matches) || !Number.isInteger(result.totalMatches) || result.totalMatches < 0
+      || result.matches.some(match => !Number.isInteger(match?.turn) || typeof match.excerpt !== "string"
+        || !["assistant", "user"].includes(match.role))) {
+    return errorCardHTML("历史检索结果不完整");
+  }
+  const matches = result.matches.map(match => {
+    const role = match.role === "assistant" ? "正式回答" : "用户问题";
+    const excerpt = esc(match.excerpt).replace(/\*\*(.+?)\*\*/gs, "<mark>$1</mark>");
+    const sources = (match.role === "assistant" && Array.isArray(match.citations) ? match.citations : [])
+      .filter(cite => cite?.materialId && normalizeLocator(cite.locator))
+      .map(cite => {
+        const source = cite.filename || cite.materialId;
+        if (!Number.isInteger(cite.version) || cite.version < 1) return esc(`${source} · ${cite.locator}`);
+        return citationButton(cite, `${source} v${cite.version} · ${cite.locator}`);
+      });
+    return `<li><span class="tc-meta">第 ${esc(match.turn)} 轮 · ${role}</span>
+      <div class="tc-summary">${excerpt}</div>${sources.join(" ")}</li>`;
+  }).join("");
+  const count = result.totalMatches;
+  const summary = count ? `历史问答命中 ${count} 条` : "历史问答未命中";
+  return `<div class="tool-result-card transcript-search-card" data-tool-call-id="${esc(tool.id)}">
+    <div class="tc-head"><span class="tc-title">${summary}</span>
+      ${result.ledgerTotalMatches > 0 ? `<span class="tc-meta">台账命中 ${esc(result.ledgerTotalMatches)} 条</span>` : ""}</div>
+    ${matches ? `<ul>${matches}</ul>` : ""}
+    ${result.displayTruncated || result.coverage?.truncated ? '<div class="tc-note">仅展示部分工具结果</div>' : ""}
+  </div>`;
 }
 
 /* ---------- workbook ---------- */

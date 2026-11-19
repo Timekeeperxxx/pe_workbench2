@@ -131,9 +131,14 @@ export function citationIdentity(citation) {
   return `${citation.materialId}@v${citation.version ?? 0}`;
 }
 
+export function citationFilenames(citation) {
+  return [...new Set([citation?.filename, citation?.storedFilename].filter(Boolean))];
+}
+
 export function citationQualifiers(citation) {
-  return ['', citation.materialId, citationIdentity(citation), ...(citation.filename
-    ? [citation.filename, `${citation.filename}@v${citation.version}`] : [])].map(alias => alias.toLowerCase());
+  const names = citationFilenames(citation);
+  return ['', citation.materialId, citationIdentity(citation), ...names.flatMap(name =>
+    [name, `${name}@v${citation.version}`])].map(alias => alias.toLowerCase());
 }
 
 export function citationLookup(citations) {
@@ -166,6 +171,40 @@ export function citationLookup(citations) {
       return matches.length === 1 && !isBlocked(matches[0], qualifier) ? matches[0] : undefined;
     },
   };
+}
+
+// The Chinese display label and the tool field name can be given together.
+// Both name the same field; only its value is compared to a returned ID.
+const idLabel = String.raw`(?:引用\s*ID|\bcitation[ ._-]*id)`;
+const labelStyle = '[`*\\s]*';
+const alias = `(?:[（(]${labelStyle}${idLabel}${labelStyle}[)）]${labelStyle})?`;
+const parenthesizedLabel = `(?:引用)?[（(]${labelStyle}${idLabel}${labelStyle}[)）]`;
+const idMarker = `(?:${parenthesizedLabel}|${idLabel}${labelStyle}${alias})` + labelStyle +
+  '(?:字段)?(?:完整(?:值|形式)?)?(?:为|是)?\\s*[:：=]?\\s*[`*]*';
+
+// A citation ID is opaque metadata. Its embedded Sheet!A1 is not a
+// second, unqualified locator. Keep offsets stable for lint and HTML rendering.
+export function maskCitationIds(text, citations = [], onField) {
+  const marker = new RegExp(idMarker + String.raw`|\b(?:cite|derived):`, 'gi');
+  let masked = '';
+  let end = 0;
+  for (let match; (match = marker.exec(text));) {
+    const bare = /^(?:cite|derived):$/i.test(match[0]);
+    const start = bare ? match.index : marker.lastIndex;
+    const cited = citations.find(cell => cell.id && text.startsWith(cell.id, start) &&
+      /^(?:$|[\s。，、；！？,!)）\]】”"’'`*;]|[.?](?![\w.-]))/.test(text.slice(start + cell.id.length)));
+    if (!cited) {
+      const token = text.slice(start).match(/^[^\s，。；）)`]*/)[0];
+      onField?.(undefined, text.slice(match.index, start) + token);
+      continue;
+    }
+    const fieldEnd = start + cited.id.length;
+    onField?.(cited, text.slice(match.index, fieldEnd));
+    masked += text.slice(end, match.index) + ' '.repeat(fieldEnd - match.index);
+    end = fieldEnd;
+    marker.lastIndex = end;
+  }
+  return masked + text.slice(end);
 }
 
 /** Return every locator-shaped token, including duplicates, with positions. */

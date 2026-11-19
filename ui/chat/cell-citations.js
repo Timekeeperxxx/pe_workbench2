@@ -14,6 +14,7 @@ import {
   citationIdentity,
   citationLookup,
   normalizeLocator,
+  maskCitationIds,
   resolveLocatorToken,
 } from "./citation-locator.js";
 
@@ -49,7 +50,7 @@ function citationTitle(citation) {
   return `打开 ${parts.join(" · ")}`;
 }
 
-function citationButton(citation, label) {
+export function citationButton(citation, label) {
   const version = Number(citation.version);
   const locator = normalizeLocator(citation.locator) || String(citation.locator);
   const attrs = [
@@ -68,7 +69,7 @@ function unverifiedSpan(label) {
   return `<span class="cell-ref-unverified" title="未核验：本轮工具未返回这个单元格">${escapeHTML(label)}</span>`;
 }
 
-function linkText(html, lookup, state) {
+function linkText(html, lookup, state, citations) {
   if (!html) return "";
   // Match sheet names and workbook qualifiers in visible text. Copy untouched
   // spans from the original HTML and escape any text inserted into a button.
@@ -79,6 +80,7 @@ function linkText(html, lookup, state) {
     offsets.push({ at: index + entity.length - shift, shift });
     return HTML_ENTITIES[entity];
   });
+  const searchable = maskCitationIds(text, citations);
   const rawIndex = index => index + (offsets.findLast(offset => offset.at <= index)?.shift || 0);
   const rawSlice = (start, end = text.length) => html.slice(rawIndex(start), rawIndex(end));
   let output = "";
@@ -135,7 +137,7 @@ function linkText(html, lookup, state) {
 
     const regex = new RegExp(LOCATOR_RE.source, "g");
     regex.lastIndex = index;
-    const match = regex.exec(text);
+    const match = regex.exec(searchable);
     if (!match) {
       finishTail(text.slice(index));
       break;
@@ -184,6 +186,10 @@ export function linkCitations(textHtml, citations) {
   const lookup = citationLookup(citations);
   if (!lookup.size || !html) return html;
 
+  // Older messages can cite a cell only through its ID. Keep their original
+  // locator link when the message has no separate, written workbook coordinate.
+  const visible = html.replace(/<[^>]*>/g, '');
+  const metadata = new RegExp(LOCATOR_SOURCE).test(maskCitationIds(visible, citations)) ? citations : [];
   const state = { sheet: null, sep: false };
   const reset = () => {
     state.sheet = null;
@@ -197,7 +203,7 @@ export function linkCitations(textHtml, citations) {
     const start = match.index ?? 0;
     if (start > cursor) {
       const text = html.slice(cursor, start);
-      output += skipDepth > 0 ? text : linkText(text, lookup, state);
+      output += skipDepth > 0 ? text : linkText(text, lookup, state, metadata);
     }
     const token = match[0];
     output += token;
@@ -214,7 +220,7 @@ export function linkCitations(textHtml, citations) {
   }
   if (cursor < html.length) {
     const text = html.slice(cursor);
-    output += skipDepth > 0 ? text : linkText(text, lookup, state);
+    output += skipDepth > 0 ? text : linkText(text, lookup, state, metadata);
   }
   return output;
 }

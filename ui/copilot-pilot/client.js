@@ -9,6 +9,7 @@
 
 import { CopilotKitCore } from "@copilotkit/core";
 
+import { receiveDelivery } from "../chat/turn-delivery.js";
 import { state } from "../state/store.js";
 import { runtime } from "../runtime.js";
 import { renderThread, retainLiveUntilSnapshot, scheduleThread } from "../chat/renderer.js";
@@ -18,7 +19,6 @@ import { attachAgentSubscriptions, attachCoreSubscriptions } from "./subscriptio
 import {
   metricsSnapshot,
   newId,
-  nowHM,
   parseArgs,
   resultText,
   toolDetail,
@@ -79,9 +79,10 @@ export class CopilotPilotClient {
     this.connectPromise = null;
     this.connectSessionId = null;
     this.connectToken = null;
+    this.initialSnapshotPending = false;
     this.reconnectTimer = null;
     this.reconnectAttempts = 0;
-    this.reconnectInFlight = false;
+    this.reconnectInFlight = null;
     this.runToken = null;
     this.runIdOnWire = null;
     this.activeRunId = null;
@@ -203,13 +204,14 @@ export class CopilotPilotClient {
       onRunStartedEvent: ({ event }) => {
         if (!this.#isCurrent() || !this.acceptEvents) return;
         if (this.connectActiveRunId && event.runId !== this.connectActiveRunId) return;
+        if (this.deliveredRunId === event.runId) return;
         this.activeRunId = event.runId;
         this.finishedRunId = null;
         this.reconnectAttempts = 0;
         this.metrics.runStarted += 1;
         this.metrics.sendStartedAt = this.metrics.sendStartedAt || performance.now();
         state.streaming = true;
-        state.live = { text: "", tools: [], startedAt: Date.now() };
+        if (!state.live.turnId) state.live = { text: "", tools: [], startedAt: Date.now() };
         runtime.syncStop?.();
         renderThread('follow');
       },
@@ -217,16 +219,32 @@ export class CopilotPilotClient {
         if (!this.#acceptStreamEvent()) return;
         this.metrics.textStart += 1;
       },
-      onTextMessageContentEvent: ({ event }) => {
+      onTextMessageContentEvent: () => {
         if (!this.#acceptStreamEvent()) return;
         this.metrics.textDelta += 1;
         if (!this.metrics.firstTextAt) this.metrics.firstTextAt = performance.now();
-        state.live.text += event.delta || "";
-        scheduleThread();
+        // pe.turn_delivery supplies text, citations and status atomically.
       },
       onTextMessageEndEvent: () => {
         if (!this.#acceptStreamEvent()) return;
         this.metrics.textEnd += 1;
+      },
+      onCustomEvent: ({ event }) => {
+        if (!this.#acceptStreamEvent()) return;
+        if (event.name === "pi.tool_progress") {
+          const tool = this.#findTool(event.value?.toolCallId);
+          if (tool?.status === "running") {
+            tool.output = String(event.value.content || "");
+            scheduleThread();
+          }
+          return;
+        }
+        if (event.name !== "pe.turn_delivery") return;
+        this.deliveredRunId = this.activeRunId;
+        if (!receiveDelivery(state, event.value)) return;
+        runtime.resetLive?.();
+        runtime.syncStop?.();
+        renderThread('follow');
       },
       onToolCallStartEvent: ({ event }) => {
         if (!this.#acceptStreamEvent()) return;
@@ -332,11 +350,13 @@ export class CopilotPilotClient {
   #isConnectCurrent(token, sessionId) {
     return this.connectToken === token
       && this.sessionId === sessionId
-      && this.projectId === state.project?.id;
+      && this.#isCurrent();
   }
 
   async #connect(sessionId) {
+    if (this.sessionId !== sessionId) this.#resetReconnect();
     this.sessionId = sessionId;
+    this.initialSnapshotPending = true;
     const token = Symbol("connect-session");
     this.connectToken = token;
     const agent = await this.ensureCore();
@@ -364,30 +384,38 @@ export class CopilotPilotClient {
 
     // Canonical Pi snapshot supplies history and structured tool cards. The
     // pilot never asks Core to own or persist conversation history.
-    await runtime.refreshSnapshot?.({
-      watch: false,
-      preserveLive: false,
-      guard: () => this.#isConnectCurrent(token, sessionId),
-    });
-    if (!this.#isConnectCurrent(token, sessionId)) return;
-
-    if (!state.streaming) {
-      this.#resetReconnect();
+    try {
+      await runtime.refreshSnapshot?.({
+        watch: false,
+        preserveLive: false,
+        throwOnError: true,
+        guard: () => this.#isConnectCurrent(token, sessionId),
+      });
+    } catch {
+      if (this.#isConnectCurrent(token, sessionId)) {
+        this.awaitingReconnect = true;
+        this.#scheduleReconnect();
+      }
       return;
     }
+    if (!this.#isConnectCurrent(token, sessionId)) return;
+    this.initialSnapshotPending = false;
+    this.#resetReconnect();
+
+    if (!state.streaming) return;
 
     // A thread replay contains every historical run. Only the run reported as
     // active by the server is allowed to drive the live UI; otherwise the first
     // historical RUN_FINISHED would end the current run on the client.
     let cursorError = null;
+    let cursor;
     try {
-      const cursor = await api(`/api/copilotkit/thread/${encodeURIComponent(sessionId)}/state`);
-      this.connectActiveRunId = cursor?.activeRunId || null;
+      cursor = await api(`/api/copilotkit/thread/${encodeURIComponent(sessionId)}/state`);
     } catch (error) {
       cursorError = error;
-      this.connectActiveRunId = null;
     }
     if (!this.#isConnectCurrent(token, sessionId)) return;
+    this.connectActiveRunId = cursor?.activeRunId || null;
     if (!this.connectActiveRunId) {
       this.acceptEvents = false;
       if (cursorError && isNetworkError(cursorError)) {
@@ -395,9 +423,8 @@ export class CopilotPilotClient {
         this.#scheduleReconnect();
         return;
       }
-      state.streaming = false;
-      runtime.syncStop?.();
-      toast("无法定位当前运行，已停止客户端重连");
+      // A turn may settle between reading the initial snapshot and the replay cursor.
+      await runtime.refreshSnapshot?.({ guard: () => this.#isConnectCurrent(token, sessionId) });
       return;
     }
 
@@ -518,29 +545,21 @@ export class CopilotPilotClient {
     } catch (error) {
       this.expectedAbort = false;
       toast(`停止失败：${error?.message || error}`);
-      this.finalizePromise = this.#finishRun(this.activeRunId, null);
-      await this.finalizePromise;
+      await this.reconnect();
       return;
     }
     this.finalizePromise = this.#finishRun(this.activeRunId, null);
     await this.finalizePromise;
-    if (this.expectedAbort) {
-      // The server abort and the final snapshot can race by a few ms. The user
-      // pressed stop, so the UI must not stay in a running state.
-      this.awaitingReconnect = false;
-      state.streaming = false;
-      runtime.syncStop?.();
-      renderThread('follow');
-    }
   }
 
   async reconnect(options = {}) {
-    if (this.reconnectInFlight) return;
-    this.reconnectInFlight = true;
+    if (this.reconnectInFlight?.token === this.connectToken) return;
+    const attempt = { token: this.connectToken };
+    this.reconnectInFlight = attempt;
     try {
       return await this.#reconnect(options);
     } finally {
-      this.reconnectInFlight = false;
+      if (this.reconnectInFlight === attempt) this.reconnectInFlight = null;
     }
   }
 
@@ -548,6 +567,10 @@ export class CopilotPilotClient {
     if (!this.core || !this.agent || !this.sessionId) return;
     if (!auto) this.#resetReconnect();
     this.#clearReconnectTimer();
+    const sessionId = this.sessionId;
+    if (this.initialSnapshotPending) return this.connect(sessionId);
+    const sessionToken = this.connectToken;
+    const guard = () => this.#isConnectCurrent(sessionToken, sessionId);
     // Close the browser stream without calling Core's stop endpoint: the Pi
     // run must keep going on the server for replay to recover anything.
     this.acceptEvents = false;
@@ -557,15 +580,17 @@ export class CopilotPilotClient {
     } catch {
       /* no stream to detach */
     }
+    if (!guard()) return;
     this.expectedAbort = false;
     let cursor = null;
     let cursorError = null;
     try {
-      cursor = await api(`/api/copilotkit/thread/${encodeURIComponent(this.sessionId)}/state`);
+      cursor = await api(`/api/copilotkit/thread/${encodeURIComponent(sessionId)}/state`);
     } catch (error) {
       cursorError = error;
       cursor = null;
     }
+    if (!guard()) return;
     this.metrics.reconnects += 1;
     this.expectedAbort = false;
     this.finishedRunId = null;
@@ -580,8 +605,14 @@ export class CopilotPilotClient {
         this.#scheduleReconnect();
         return;
       }
-      await runtime.refreshSnapshot?.({ watch: false, forceStopped: true, preserveLive: false });
-      this.#resetReconnect();
+      try {
+        await runtime.refreshSnapshot?.({ preserveLive: false, throwOnError: true, guard });
+        if (guard()) this.#resetReconnect();
+      } catch {
+        if (!guard()) return;
+        this.awaitingReconnect = true;
+        this.#scheduleReconnect();
+      }
       return;
     }
     this.acceptEvents = true;
@@ -622,6 +653,8 @@ export class CopilotPilotClient {
     this.runIdOnWire = null;
     this.connectActiveRunId = null;
     this.sessionId = null;
+    this.connectToken = null;
+    this.initialSnapshotPending = false;
     this.finalizePromise = null;
     try {
       void this.agent?.detachActiveRun().catch(() => {});
@@ -657,16 +690,6 @@ export class CopilotPilotClient {
 
   /* ---------- internals ---------- */
 
-  async #abandonRun(error) {
-    if (!this.sessionId || !this.#isCurrent()) return;
-    try {
-      await api(`/api/copilotkit/agent/pi/stop/${encodeURIComponent(this.sessionId)}`, { method: "POST" });
-    } catch {
-      /* the final snapshot is still the best available reconciliation */
-    }
-    this.finalizePromise = this.#finishRun(this.activeRunId, error);
-  }
-
   #clearReconnectTimer() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -681,18 +704,14 @@ export class CopilotPilotClient {
   }
 
   #scheduleReconnect() {
-    if (this.reconnectTimer || !this.sessionId || !state.streaming) return;
-    if (this.reconnectAttempts >= 5) {
-      this.awaitingReconnect = false;
-      void this.#abandonRun(new Error("CopilotKit 重连失败"));
-      return;
-    }
+    if (this.reconnectTimer || !this.#isCurrent() || (!state.streaming && !this.initialSnapshotPending)) return;
+    // A client-side disconnect never cancels the server's verification.
     const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 8000);
     this.reconnectAttempts += 1;
     if (this.reconnectAttempts === 1) toast("连接中断，正在重连…");
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      if (!this.awaitingReconnect || !this.#isCurrent() || !state.streaming) return;
+      if (!this.awaitingReconnect || !this.#isCurrent() || (!state.streaming && !this.initialSnapshotPending)) return;
       void this.reconnect({ auto: true });
     }, delay);
   }
@@ -707,7 +726,7 @@ export class CopilotPilotClient {
   }
 
   #acceptStreamEvent() {
-    if (!this.#isCurrent() || !this.acceptEvents || !this.activeRunId) return false;
+    if (!this.#isCurrent() || !this.acceptEvents || !this.activeRunId || this.deliveredRunId === this.activeRunId) return false;
     if (this.connectActiveRunId && this.activeRunId !== this.connectActiveRunId) return false;
     return true;
   }
@@ -737,12 +756,13 @@ export class CopilotPilotClient {
     this.#resetReconnect();
     this.acceptEvents = false;
     this.activeRunId = null;
-    retainLiveUntilSnapshot();
-    state.streaming = false;
+    const delivered = Boolean(runId && this.deliveredRunId === runId);
+    if (!delivered && state.streaming) retainLiveUntilSnapshot();
+    if (delivered) state.streaming = false;
     runtime.syncStop?.();
     // Keep the live DOM until the snapshot (or fallback) replaces it. Removing
     // it now clamps scrollTop and loses the reader's position inside the reply.
-    if (error) {
+    if (error && !delivered) {
       this.lastError = error.message || String(error);
       toast(`运行失败：${this.lastError}`);
     }
@@ -756,22 +776,16 @@ export class CopilotPilotClient {
         guard: () => this.runToken === token,
       });
     } catch {
-      if (this.runToken === token) this.#commitLive();
+      if (this.runToken === token) {
+        runtime.resetLive?.();
+        renderThread('follow');
+        if (!delivered) {
+          state.streaming = true;
+          this.awaitingReconnect = true;
+          this.#scheduleReconnect();
+        }
+      }
     }
-  }
-
-  #commitLive() {
-    if (!this.#isCurrent()) return;
-    const live = state.live;
-    if (!live.text && !live.tools.length) return;
-    state.messages.push({
-      role: "assistant",
-      text: live.text,
-      tools: live.tools.map((tool) => ({ ...tool })),
-      time: nowHM(),
-    });
-    state.live = { text: "", tools: [], startedAt: 0 };
-    renderThread('follow');
   }
 
   #disposeCore() {
