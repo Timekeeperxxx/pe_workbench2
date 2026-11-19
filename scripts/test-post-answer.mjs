@@ -555,7 +555,46 @@ console.log('target deviation post-answer correction passed');
     }
     const returned = { ...liveSource, id: canonicalId };
     const idSearch = { matches: [{ ...hit, citations: [returned] }] };
+    const originalDraft = `第1轮回答引用的是 [${returned.materialId}@v1]Model!B2，命中的完整 citation.id 为 \`${canonicalId}\`，该引用指向工作簿 Acceptance13.xlsx 的 Model!B2（材料 ID 为 ${returned.materialId}，版本为 1）。`;
+    const alternateCell = { ...returned, id: canonicalId.replace('!B2', '!C3'), locator: 'Model!C3' };
+    const bothCells = { matches: [{ ...hit, citations: [returned, alternateCell] }] };
+    for (const text of [
+      originalDraft.replace('的 Model!B2（', '的 Model!C3（'),
+      originalDraft.replace(canonicalId, alternateCell.id),
+      originalDraft.replace('指向工作簿 Acceptance13.xlsx', '指向工作簿 FakeAcceptance13.xlsx'),
+      originalDraft.replace('版本为 1', '版本为 2'),
+    ]) {
+      const { record } = await runScript([{ search: bothCells, text }, { text }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['failed', '', []], text);
+    }
+    const stored = { ...returned, storedFilename: '1795056222659-Acceptance13.xlsx' };
+    const storedSearch = { matches: [{ ...hit, citations: [stored] }] };
+    // A second, genuine locator must not validate a different workbook
+    // named in prose. Chinese letters and '+' can belong to a filename.
+    for (const prefix of ['', '假', 'copy+', 'copy of ', '假工作簿']) {
+      const text = `第1轮正式答文在工作簿 ${prefix}${stored.storedFilename} 中引用了 [Acceptance13.xlsx]Model!B2。`;
+      const steps = [{ search: storedSearch, text }, ...(prefix ? [{ text }] : [])];
+      const { record } = await runScript(steps, sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations],
+        prefix ? ['failed', '', []] : ['completed', text, [stored]]);
+    }
+    const reportsWithFilename = [
+      `第1轮已交付回答引用的出处是 [Acceptance13.xlsx]Model!B2（材料 ID：${stored.materialId}，版本 1；存储文件名：${stored.storedFilename}），命中的完整引用 ID 为 ${canonicalId}。`,
+      `第1轮已交付回答引用的出处是 [Acceptance13.xlsx]Model!B2，材料 ID 为 ${stored.materialId}（版本 1），存储文件名是 ${stored.storedFilename}，命中的完整引用 ID 为 ${canonicalId}。`,
+    ];
+    for (const text of reportsWithFilename) {
+      const { record } = await runScript([{ search: storedSearch, text }], sourceQuestion);
+      assert.deepEqual([record.status, record.text, record.citations], ['completed', text, [stored]]);
+      for (const wrongName of ['unknown-' + stored.storedFilename, stored.filename]) {
+        const wrong = text.replace(stored.storedFilename, wrongName);
+        const { record } = await runScript([{ search: storedSearch, text: wrong }, { text: wrong }], sourceQuestion);
+        assert.ok(!record.text.includes('存储文件名'), record.text);
+      }
+    }
     const providerReports = [
+      originalDraft,
+      '今天检索到的第1轮回答引用的是 [Acceptance13.xlsx]Model!B2（材料版本 v1）。',
+      `第1轮回答的出处是工作簿 Acceptance13.xlsx 的 Model!B2，对应材料 ID ${returned.materialId}、版本 v1，完整引用写作 [Acceptance13.xlsx]Model!B2，其 citation.id 为 \`${canonicalId}\`。`,
       `在第1轮回答中，所引用的出处是工作簿文件 Acceptance13.xlsx，材料 ID 为 ${liveSource.materialId}、版本为 v1，单元格为 Model!B2；按引用格式写作 [Acceptance13.xlsx]Model!B2（引用 ID：cite:${liveSource.materialId}:v1:Model!B2）。`,
       `第1轮回答中引用的出处是工作簿 Acceptance13.xlsx（材料 ID ${liveSource.materialId}、版本 v1）的 [Acceptance13.xlsx]Model!B2，引用 ID 为 cite:${liveSource.materialId}:v1:Model!B2。`,
       `第 1 轮中的回答引用了工作簿 Acceptance13.xlsx，材料版本为 v1（材料 ID：${liveSource.materialId}），单元格是 Model!B2，也就是 Sheet 为 Model 的 B2 单元格；对应的完整引用 ID 是 cite:${liveSource.materialId}:v1:Model!B2。`,
@@ -594,7 +633,7 @@ console.log('target deviation post-answer correction passed');
     const wrongFile = providerReports.at(-2).replace('Acceptance13.xlsx', 'Other.xlsx');
     const mismatch = await runScript([{ search: idSearch, text: wrongFile }, { text: wrongFile }], sourceQuestion);
     assert.ok(!mismatch.record.text.includes('Other.xlsx'));
-    const wrongSheet = providerReports[2].replace('Sheet 为 Model 的 B2', 'Sheet 为 Other 的 B2');
+    const wrongSheet = providerReports.find(text => text.includes('Sheet 为 Model')).replace('Sheet 为 Model 的 B2', 'Sheet 为 Other 的 B2');
     const wrongReport = await runScript([{ search: idSearch, text: wrongSheet }, { text: wrongSheet }], sourceQuestion);
     assert.equal(wrongReport.record.status, 'failed');
     for (const [note, expected] of [['当时用的是第一版。', 'completed'], ['当时用的是第二版。', 'partial'], ['当时用的是第二版，现在文件已更新。', 'partial']]) {
@@ -682,6 +721,8 @@ console.log('target deviation post-answer correction passed');
     const historicalSource = '第一轮正式回答引用的是 [' + liveSource.materialId + '@v1]Model!B2。';
     const versionQuestion = '请查第1轮正式答文引用的是哪个单元格与材料版本，并说明同一材料当前是哪个版本。';
     for (const [note, read, accepted] of [
+      ['截至今天，这份材料的版本为 v2。', [direct], true], ['截至今天，这份材料的版本为 v1。', [direct], false],
+      ['截至今天，这份材料的版本为 v1。', [], false], ['截至今天，这份材料的版本为 v2。', [], false],
       ['当前材料版本为 v1。', [], false], ['当前材料版本为 v2。', [], false],
       ['当前材料版本为 v1。', [direct], false], ['当前材料版本为 v2。', [direct], true],
       ['当前材料版本为 v2。', [{ ...direct, materialId: 'other' }], false],
@@ -696,6 +737,13 @@ console.log('target deviation post-answer correction passed');
       const { record } = await runScript(steps, versionQuestion);
       assert.deepEqual([record.status, record.text, record.citations],
         [accepted ? 'completed' : 'partial', accepted ? text : historicalSource, [returned]], note);
+    }
+    for (const [currentVersion, accepted] of [['v2', true], ['v1', false]]) {
+      const text = '截至今天，这份材料的版本为 ' + currentVersion + '。' + historicalSource;
+      const { record } = await runScript([{ citations: [direct], text: '依据 Missing!A9。' },
+        { search: idSearch, text }], versionQuestion);
+      assert.deepEqual([record.status, record.text, record.citations],
+        [accepted ? 'completed' : 'partial', accepted ? text : historicalSource, [returned]]);
     }
     const directNote = '本轮直接读取的数值为 942，依据 [' + liveSource.materialId + '@v2]Model!B2（引用 ID：' + direct.id + '）。';
     const both = '第一轮正式回答引用的是 [' + liveSource.materialId + '@v1]Model!B2。' + directNote;

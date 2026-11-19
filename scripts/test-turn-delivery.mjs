@@ -406,6 +406,7 @@ sys.stdout.buffer.write(data.getvalue())
   const initial = workbook(317);
   const updated = workbook(942);
   const coldCases = [];
+  const coldTraces = [];
   const original = `最终稿B（字段名 isError）依据 [${filename}]Model!B2。`;
   const historical = `历史检索命中。那条正式回答引用的是 [${filename}]Model!B2。`;
   const internal = "用户还没有看到这份草稿";
@@ -433,14 +434,16 @@ sys.stdout.buffer.write(data.getvalue())
     const targets = await links.evaluateAll(nodes => nodes.map(({ dataset }) =>
       [dataset.materialId, dataset.version, dataset.locator]));
     assert.ok(targets.length > 0);
-    for (const target of targets) assert.deepEqual(target, [materialId, "1", "Model!B2"]);
-    await links.first().click();
-    const cell = page.locator('#xlsxSheet .xlsx-c.is-sel[data-r="2"][data-c="2"]');
-    await cell.waitFor();
-    assert.equal(await cell.innerText(), "317");
-    assert.equal(await page.locator('#xlsxTabs [aria-selected="true"]').innerText(), "Model");
-    assert.deepEqual(await page.evaluate(() => [state.openFileId, state.selectedVersion]), [materialId, 1]);
-    await page.locator("#dClose").click();
+    for (const [index, target] of targets.entries()) {
+      assert.deepEqual(target, [materialId, "1", "Model!B2"]);
+      await links.nth(index).click();
+      const cell = page.locator('#xlsxSheet .xlsx-c.is-sel[data-r="2"][data-c="2"]');
+      await cell.waitFor();
+      assert.equal(await cell.innerText(), "317");
+      assert.equal(await page.locator('#xlsxTabs [aria-selected="true"]').innerText(), "Model");
+      assert.deepEqual(await page.evaluate(() => [state.openFileId, state.selectedVersion]), [materialId, 1]);
+      await page.locator("#dClose").click();
+    }
   }
 
   async function checkReply(ui, record, index) {
@@ -449,7 +452,7 @@ sys.stdout.buffer.write(data.getvalue())
     const copies = await ui.page.evaluate(id => state.messages.filter(m => m.role === "assistant" && m.turnId === id), record.turnId);
     assert.deepEqual(copies.map(publicAnswer), [publicAnswer(record)]);
     const body = answers(ui.page).nth(index).locator(".msg-body");
-    if (record.status === "completed") assert.equal(await body.innerText(), record.text);
+    if (record.status === "completed") assert.equal(await body.innerText(), record.text.replace(/`([^`]+)`/g, "$1"));
     else if (record.text) assert.ok((await body.innerText()).includes(record.text));
     else assert.equal(await body.locator("[data-cell-cite]").count(), 0);
     return body;
@@ -508,6 +511,43 @@ sys.stdout.buffer.write(data.getvalue())
           await answers(ui.page).first().locator(".msg-body").getByText(original, { exact: true }).waitFor();
           assert.ok(entry.session.sessionManager.getBranch().some(row =>
             row.customType === "pe_answer_correct" && JSON.stringify(row.content).includes(internal)));
+        }
+        if (history === "managed") {
+          await t.test("workbook_trace resolves the exact uploaded basename and rejects an invented prefix", async t => {
+            const traceUI = await open(t, transport);
+            const { id: traceId, entry } = await traceUI.newSession();
+            const uploadedName = book.path.split("/").at(-1);
+            assert.notEqual(uploadedName, filename);
+            for (const [index, name] of [uploadedName, filename, "invented-" + uploadedName].entries()) {
+              const text = `[${name}]Model!B2 储存的字面常量是 317，单元格内没有公式。`;
+              const model = scriptModel(entry, [
+                { toolName: "workbook_trace", toolId: "trace-" + index, tool: { path: book.path, mode: "cell", cell: "Model!B2" }, stopReason: "toolUse" },
+                { text, pause: true }, { text },
+              ]);
+              t.after(model.resume);
+              await traceUI.send("请核对这份工作簿中 Model!B2 的字面常量。");
+              await bounded(model.paused, "upload trace did not return");
+              const result = entry.session.sessionManager.getBranch().map(row => row.message)
+                .find(m => m?.role === "toolResult" && m.toolCallId === "trace-" + index);
+              assert.equal(result.details.path, book.path);
+              assert.ok(result.details.citations.some(c => c.materialId === book.material.id && c.version === 1 &&
+                c.locator === "Model!B2" && c.value === 317));
+              const pending = entry.postAnswerRun;
+              model.resume();
+              const record = await bounded(pending, "upload trace did not settle");
+              if (index === 2) {
+                assert.deepEqual([record.status, record.text, record.citations], ["failed", "", []]);
+              } else {
+                assert.deepEqual([record.status, record.text, record.citations.map(c => c.id)],
+                  ["completed", text, [citationIdFor(book.material.id, 1, "Model!B2")]]);
+              }
+              if (index === 0) coldTraces.push({ transport, traceId, materialId: book.material.id, record });
+              await checkReply(traceUI, record, index);
+              await traceUI.reload(traceId);
+              const body = await checkReply(traceUI, record, index);
+              if (index < 2) await openOriginalCell(traceUI.page, body, book.material.id);
+            }
+          });
         }
         const snapshot = async () => (await json(`/api/sessions/${id}/state`)).messages.filter(m => m.role === "assistant");
         const [first] = await snapshot();
@@ -606,16 +646,21 @@ sys.stdout.buffer.write(data.getvalue())
           { ending: "（材料第二版）。", reject: true },
           { ending: "。材料版本为 v2。", invalid: "v2" },
           { ending: `（材料版本 v1，命中所带的完整引用 ID：${citationId}）。`, inspect: true },
+          { ending: "真实首稿", answer: `第1轮回答引用的是 [${book.material.id}@v1]Model!B2，命中的完整 citation.id 为 \`${citationId}\`，该引用指向工作簿 Acceptance13.xlsx 的 Model!B2（材料 ID 为 ${book.material.id}，版本为 1）。`, inspect: true },
+          { ending: "真实纠错稿", answer: `第1轮回答的出处是工作簿 Acceptance13.xlsx 的 Model!B2，对应材料 ID ${book.material.id}、版本 v1，完整引用写作 [Acceptance13.xlsx]Model!B2，其 citation.id 为 \`${citationId}\`。`, inspect: true },
+          { ending: "。截至今天，这份材料的版本为 v2。", scoped: true, read: true, inspect: true },
+          { ending: "。截至今天，这份材料的版本为 v1。", scoped: true, read: true, invalid: "这份材料的版本" },
+          { ending: "。截至今天，这份材料的版本为 v1。", scoped: true, invalid: "这份材料的版本" },
           { ending: "。当前材料版本为 v1。", scoped: true, invalid: "当前材料版本为 v1" },
           { ending: "。当前材料版本为 v1。", scoped: true, read: true, invalid: "当前材料版本为 v1" },
           { ending: "。当前材料版本为 v2。", scoped: true, read: true, inspect: true },
         ];
         const coldReplies = [];
         coldCases.push({ transport, history, id, materialId: book.material.id, coldReplies });
-        for (const [variant, { ending, inspect, reject, invalid, scoped, read }] of cases.entries()) {
+        for (const [variant, { ending, answer, inspect, reject, invalid, scoped, read }] of cases.entries()) {
           await t.test(`reported source ${ending === "。" ? "without version" : ending}${read ? " after workbook_query" : ""}`, async t => {
             const prefix = scoped ? originalSource : source;
-            const text = prefix + ending;
+            const text = answer ?? prefix + ending;
             const start = branch().length;
             const model = scriptModel(entry, [
               { toolId: `version-${variant}`, toolName: "transcript_search", tool: { query: queries[0], turn: 1 }, stopReason: "toolUse" },
@@ -665,6 +710,7 @@ sys.stdout.buffer.write(data.getvalue())
               await openOriginalCell(peer.page, await checkReply(peer, delivered, index), book.material.id);
               await ui.reload(id);
               const body = await checkReply(ui, delivered, index);
+              if (answer) assert.equal(await body.locator("[data-cell-cite]").count(), 2);
               await openOriginalCell(ui.page, body, book.material.id);
             }
           });
@@ -673,12 +719,22 @@ sys.stdout.buffer.write(data.getvalue())
     }
   }
   return async function checkRestartedHistory(t, origin) {
+    for (const transport of ["legacy", "agui"]) {
+      await t.test(`Chrome ${transport}: stored filename opens the original version after restart`, async t => {
+        const ui = await open(t, transport, origin);
+        const trace = coldTraces.find(item => item.transport === transport);
+        assert.ok(trace, "missing original trace delivery");
+        const { traceId, materialId, record } = trace;
+        await ui.select(traceId);
+        await openOriginalCell(ui.page, await checkReply(ui, record, 0), materialId);
+      });
+    }
     assert.equal(coldCases.length, 4);
     for (const { transport, history, id, materialId, coldReplies } of coldCases) {
       await t.test(`Chrome ${transport} ${history}: exact versioned source after process restart`, async t => {
         const ui = await open(t, transport, origin);
         await ui.select(id);
-        assert.equal(coldReplies.length, 10);
+        assert.equal(coldReplies.length, 15);
         for (const { record, index } of coldReplies) {
           const body = await checkReply(ui, record, index);
           if (record.status === "completed") await openOriginalCell(ui.page, body, materialId);

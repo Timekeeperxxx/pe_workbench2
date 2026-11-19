@@ -131,9 +131,14 @@ export function citationIdentity(citation) {
   return `${citation.materialId}@v${citation.version ?? 0}`;
 }
 
+export function citationFilenames(citation) {
+  return [...new Set([citation?.filename, citation?.storedFilename].filter(Boolean))];
+}
+
 export function citationQualifiers(citation) {
-  return ['', citation.materialId, citationIdentity(citation), ...(citation.filename
-    ? [citation.filename, `${citation.filename}@v${citation.version}`] : [])].map(alias => alias.toLowerCase());
+  const names = citationFilenames(citation);
+  return ['', citation.materialId, citationIdentity(citation), ...names.flatMap(name =>
+    [name, `${name}@v${citation.version}`])].map(alias => alias.toLowerCase());
 }
 
 export function citationLookup(citations) {

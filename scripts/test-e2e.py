@@ -312,6 +312,24 @@ def run(ui: UI) -> None:
 
     print("\nbrowser: approvals")
 
+    def approve_and_verify_write(seed):
+        approval_id = seed["approval"]["id"]
+        path = f"/api/approvals/{approval_id}"
+        before = sorted(v["v"] for v in material_versions(seed["workingFile"]))
+        assert before, seed
+        with ui.page.expect_response(
+            lambda response: response.url.partition("?")[0] == BASE + path + "/approve" and response.request.method == "POST"
+        ) as completed:
+            ui.page.click(f'[data-approval-action="approve"][data-approval-id="{approval_id}"]')
+        response = completed.value
+        result = response.json()
+        assert response.status == 200 and result["ok"], result
+        assert (result["approval"]["id"], result["approval"]["status"]) == (approval_id, "applied"), result
+        record = api("GET", path)
+        assert record["status"] == "applied", record
+        after = sorted(v["v"] for v in material_versions(seed["workingFile"]))
+        assert after == before + [before[-1] + 1], (before, after)
+
     def approve():
         ui.reset()
         seed = approval_seed("approve")
@@ -319,13 +337,7 @@ def run(ui: UI) -> None:
         ui.page.wait_for_timeout(900)
         ui.page.wait_for_selector(".approval-card", timeout=5000, state="attached")
         assert "待审批" in ui.page.locator(".approval-card").inner_text()
-        ui.page.click('[data-approval-action="approve"]')
-        ui.page.wait_for_timeout(4500)
-        approvals = api("GET", "/api/approvals?status=applied")
-        all_approvals = api("GET", "/api/approvals")
-        assert any(item["id"] == seed["approval"]["id"] for item in approvals), all_approvals
-        versions = material_versions(seed["workingFile"])
-        assert len(versions) >= 2, versions
+        approve_and_verify_write(seed)
         ui.assert_no_page_errors()
 
     check("approval approve writes once and creates a version", approve)
@@ -383,8 +395,7 @@ def run(ui: UI) -> None:
         ui.page.reload(wait_until="domcontentloaded")
         ui.page.wait_for_timeout(900)
         assert "待审批" in ui.page.locator(".approval-card").first.inner_text()
-        ui.page.click('[data-approval-action="approve"]')
-        ui.page.wait_for_timeout(4500)
+        approve_and_verify_write(seed)
         ui.page.reload(wait_until="domcontentloaded")
         ui.page.wait_for_timeout(900)
         assert ui.page.locator(".approval-card").count() == 0

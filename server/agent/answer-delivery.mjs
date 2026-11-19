@@ -1,7 +1,7 @@
 import { isWorkbookMetricName } from '../../lib/workbook-query.mjs';
 import { Lexer } from 'marked';
 import { citationLookup } from '../../lib/citations.mjs';
-import { citationIdentity, citationQualifiers, extractLocatorMatches, LOCATOR_SOURCE, locatorKey, maskCitationIds, resolveLocatorToken } from '../../lib/citation-locator.mjs';
+import { citationFilenames, citationIdentity, citationQualifiers, extractLocatorMatches, LOCATOR_SOURCE, locatorKey, maskCitationIds, resolveLocatorToken } from '../../lib/citation-locator.mjs';
 
 // Keep exactly the source cells an explicit reference resolves to, including
 // a covered range and the UI's "Sheet!A1、A2" shorthand.
@@ -56,7 +56,8 @@ const REPORTED_CELL = /(?:引用|援引|出处|出自|指向|依据|来源|坐�
 const VERSION_LABEL = String.raw`(?:[\da-z_-]+(?:\.[\da-z_-]+)*|[零〇一二两三四五六七八九十百千]+)`;
 const SOURCE_VERSION = new RegExp(String.raw`(?:(?:材料|文件)(?:的)?\s*)?(?:版本(?:号)?|\bversion)\s*(?:为|是)?\s*[:=]?\s*v?\s*(${VERSION_LABEL})|(?:材料|文件)?第\s*(${VERSION_LABEL})\s*版|(?<!\w)@?v(\d+(?:\.\d+)*)\b`, 'gi');
 
-const PRESENT = /当前|目前|现在|最新|现行|现为|\b(?:current(?:ly)?|now|latest)\b/i;
+const PRESENT = /当前|目前|现在|最新|现行|现为|(?:截至|截止|直至|到)?(?:今天|今日|如今)|\b(?:current(?:ly)?|today|now|latest)\b/i;
+const SOURCE_CLAUSE_BREAK = new RegExp(String.raw`[；;]|[，,](?=\s*(?:而|但)?(?:同一|该|这份)?(?:材料|文件|工作簿)?(?:${PRESENT.source}))`, 'i');
 // Check descriptive fields against the source of the written locator. Keep the
 // original answer and its qualifiers intact for lint, delivery and linking.
 function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
@@ -73,10 +74,30 @@ function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
       hasFields = true;
       if (!cited || cited.id !== source?.id) idConflict = field;
     }).normalize('NFKC').replace(/^\s*[-•]\s+/, '').replace(/[`*]/g, '');
-    if (source?.filename) {
-      const filename = source.filename.normalize('NFKC').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const nameField = String.raw`(?:(?:工作簿|文件)(?:名(?:称)?)?\s*(?:为|是|:)?\s*)?`;
-      text = text.replace(new RegExp(nameField + String.raw`(?:\[${filename}\]|(?<![\w.-])${filename})`, 'g'), ' ');
+    const names = citationFilenames(source);
+    if (names.length) {
+      const alternatives = names.map(name => name.normalize('NFKC').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .sort((a, b) => b.length - a.length).join('|');
+      const nameField = String.raw`(?:(实际存储|存储|实际上传|磁盘|显示|原始)(?:文件)?名(?:称)?|(?:工作簿(?:文件)?|(?:上传)?文件)(?:名(?:称)?)?)\s*(?:为|是|:)?\s*`;
+      const ending = String.raw`(?![\w-]|\.[\w.-])`;
+      const knownName = String.raw`(?:\[(${alternatives})\]|(${alternatives})${ending})`;
+      // At a label, consume the whole written workbook name, including
+      // spaces. A later word in “copy of Book.xlsx” cannot identify the file.
+      const otherName = String.raw`(?:\[([^\[\]\n]+?\.xls[xm])\]|([^\[\]()，,。；;：:、\n]+?\.xls[xm])${ending})`;
+      const labeled = new RegExp(nameField + `(?:${knownName}|${otherName})`, 'g');
+      text = text.replace(labeled, (field, kind, bracketed, plain, otherBracketed, otherPlain) => {
+        hasFields = true;
+        if (otherBracketed || otherPlain) conflict = field;
+        else if (kind) {
+          const expected = /存储|上传|磁盘/.test(kind) ? source.storedFilename : source.filename;
+          if (expected?.normalize('NFKC') !== (bracketed || plain)) conflict = field;
+        }
+        return ' ';
+      });
+      // Bare names need a delimiter. Chinese letters and filename characters
+      // such as '+' must not turn an unknown name into a known suffix.
+      const boundary = String.raw`(?<!\S)|(?=\[)|(?<=[(（,，。;；:：、"“'‘《])`;
+      text = text.replace(new RegExp(`(?:${boundary})${knownName}`, 'g'), ' ');
     }
     text = text.replace(/(?:\bSheet|工作表)\s*(?:为|是|:)\s*([^，,;；()]+?)\s*的\s*(\$?[a-z]{1,3}\$?\d+)\s*单元格/gi, (field, sheet, cell) => {
       hasFields = true;
@@ -135,10 +156,12 @@ const SOURCE_WORDS = new RegExp([
 // Interpret those words only in a clause containing a checked ID; keep every
 // other assertion for the source and financial checks below.
 const SEARCH_TERMS = /transcript_search|命中项?|匹配项?|检索|搜索|查询|工具|结果|返回|提供|给出|携带|附带|所附|条/gi;
+const SOURCE_POINTER = /(?:这(?:条|个|一)?|该|其|此|上述|前述)(?:引用|出处|来源|记录)(?:所)?(?:指向|指的(?:是)?|对应(?:于)?)/;
 function sourceFieldsOnly(part, hasId) {
   if (hasId) part = part.replace(/(?:由)?[他她它](?:所)?(?=引用|援引|提供|返回|给出|携带)/g, '').replace(SEARCH_TERMS, '');
   return !part.replace(new RegExp(LOCATOR_SOURCE, 'g'), ' ')
     .replace(/第\s*[零一二三四五六七八九十百千\d]+\s*[轮次]/g, '')
+    .replace(new RegExp(SOURCE_POINTER.source, 'g'), '')
     .replace(SOURCE_WORDS, '')
     .replace(/[\s。，；、,.!:：;!？?()（）“”「」`*]/g, '');
 }
@@ -201,7 +224,10 @@ function assertsCurrentVersion(description) {
   return [...description.matchAll(SOURCE_VERSION)].some(({ index }) => {
     const prefix = description.slice(0, index);
     if (/(?:无法|不能|尚未|未能)(?:核实|核验|确认|确定)(?:为|是)?\s*$/u.test(prefix)) return false;
-    return index >= time.index || !HISTORY.test(description.slice(0, time.index));
+    // “Today I found the first answer cited …” dates the search. The
+    // historical subject between that time and the version owns the field.
+    if (index >= time.index) return !HISTORY.test(description.slice(time.index + time[0].length, index));
+    return !HISTORY.test(description.slice(0, time.index));
   });
 }
 
@@ -244,7 +270,7 @@ export function reportedLocatorEvidence(text, question, current, matches, workbo
       const cells = allowed.filter(match => !reported.size || reported.has(match.turn)).flatMap(match => match.citations);
       const historyLookup = citationLookup(cells);
       const ids = [...cells, ...current];
-      const clauses = part.split(/[；;]|[，,](?=\s*(?:而|但)?(?:同一|该|这份)?(?:材料|文件|工作簿)?(?:当前|目前|现在|最新|现行|现为))/);
+      const clauses = part.split(SOURCE_CLAUSE_BREAK);
       for (const [i, clause] of clauses.entries()) {
         const masked = maskCitationIds(clause, ids);
         const refs = extractLocatorMatches(masked);
@@ -300,7 +326,7 @@ export function reportedLocatorEvidence(text, question, current, matches, workbo
         for (const ref of checkedRefs) {
           const prefix = fields.checked.slice(start, ref.index);
           const source = resolveLocatorToken(ref.raw, historyLookup)?.citation;
-          if (isReport && antecedent && RESTATEMENT.test(prefix) && (!source ||
+          if (isReport && antecedent && (SOURCE_POINTER.test(prefix) || RESTATEMENT.test(prefix)) && (!source ||
               citationIdentity(source) !== citationIdentity(antecedent) ||
               locatorKey(source.locator) !== locatorKey(antecedent.locator))) {
             return { citations: [], conflict: ref.raw };
