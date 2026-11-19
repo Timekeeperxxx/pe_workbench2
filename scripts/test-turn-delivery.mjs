@@ -11,11 +11,12 @@ import { test } from "node:test";
 import vm from "node:vm";
 import { Type } from "typebox";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { citationIdFor } from "../lib/citations.mjs";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { loadConfig, REPO_ROOT } from "../server/config.mjs";
 import { createWorkbench } from "../server/create-app.mjs";
-import { appendCorrection, markArtifact } from "../lib/ledger.mjs";
+import { appendCorrection, markArtifact, readLedger } from "../lib/ledger.mjs";
 
 // Run the actual HTTP handlers, including SSE encoding, without binding a port.
 async function request(app, path, body, headers = {}) {
@@ -1347,7 +1348,16 @@ await test("Issue #10 regressions through uploads, Pi chat, delivery and refresh
   const config = await loadConfig({ root, env: {
     ASR: "0", WATCH_SCHEDULER: "0", TRACKING_SCHEDULER: "0", MONITOR_SCHEDULER: "0", SOURCE_SCHEDULER: "0",
   } });
-  app = await createWorkbench({ config: { ...config, indexModel: undefined } });
+  // Each case starts a new session. Its index calls summarize newly registered workbook facts.
+  const topicIndex = registerFauxProvider();
+  t.after(() => topicIndex.unregister());
+  const topicSummary = "已核验的工作簿指标";
+  const proposeSummary = () => {
+    topicIndex.appendResponses([proposeSummary]);
+    return fauxAssistantMessage(JSON.stringify({ summary: topicSummary }));
+  };
+  topicIndex.setResponses([proposeSummary]);
+  app = await createWorkbench({ config: { ...config, indexModel: topicIndex.getModel() } });
   execFileSync(process.env.PYTHON_BIN || "python3", ["-c", `
 from openpyxl import Workbook
 from pathlib import Path
@@ -1393,7 +1403,7 @@ for filename, value in [('A.xlsx', 111), ('B.xlsx', 222)]:
     assert.deepEqual(entries.filter(e => e.customType === "pe_turn_delivery").map(e => e.data), [record]);
     assert.equal(model.count(), steps.length);
     assert.equal(messages.find(m => m.role === "user").text, question);
-    return { record, assistant, entries, modelQuestion: entry.session.messages.find(m => m.role === "user").content };
+    return { record, assistant, entries, entry, modelQuestion: entry.session.messages.find(m => m.role === "user").content };
   }
 
   globalThis.document = { querySelector: () => null };
@@ -1432,10 +1442,12 @@ for filename, value in [('A.xlsx', 111), ('B.xlsx', 222)]:
       ["A.xlsx 和 B.xlsx", aRef + bRef, [destination(a, 111), destination(b, 222)]],
     ]) {
       await t.test(`references for ${asked}, reading ${reads.map(book => book.name).join(" then ")}`, async () => {
-        const { record, assistant } = await turn(`${asked} 的收入是多少？`, [...reads.map(book => query(book)), { text: response }]);
+        const { record, assistant, entry } = await turn(`${asked} 的收入是多少？`, [...reads.map(book => query(book)), { text: response }]);
         assert.deepEqual(await openedCells(assistant), expected);
         assert.equal(record.status, "completed");
         assert.equal(record.text, response);
+        const ledger = await readLedger(entry.ctx.root, entry.id);
+        assert.ok(ledger.topics.some(topic => topic.summary === topicSummary && topic.factIds.length));
       });
     }
   }
