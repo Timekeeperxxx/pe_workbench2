@@ -1,0 +1,81 @@
+name: Verify integrated Workbench changes
+on:
+  push:
+    branches: ["ci/verify-integration-246598e9"]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out the frozen product commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show "HEAD:.github/qa/context-budget.mjs" > "$RUNNER_TEMP/context-budget.mjs"
+          git checkout --detach 246598e96c8336f67f549b58b6f7421ca1010988
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.16.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install required test runtimes
+        id: runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "246598e96c8336f67f549b58b6f7421ca1010988"
+          npm ci
+          python -m pip install playwright==1.60.0 openpyxl pillow pymupdf pypdf
+          if ! command -v soffice >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install --no-install-recommends -y libreoffice-calc
+          fi
+          soffice --version
+          python -m playwright install --with-deps chromium
+          if ! command -v google-chrome >/dev/null; then python -m playwright install chrome; fi
+          echo "PE_BROWSER_PLAYWRIGHT=$(python -c 'import pathlib,playwright; print(pathlib.Path(playwright.__file__).parent/"driver/package/index.mjs")')" >> "$GITHUB_ENV"
+          echo "PYTHON_BIN=$(command -v python)" >> "$GITHUB_ENV"
+      - name: Load independent acceptance fixtures
+        uses: actions/checkout@v4
+        with:
+          ref: d603ee7a090fd7e278854db386beb2412fbaff88
+          path: .ci-qa
+          sparse-checkout: handoff/qa
+          persist-credentials: false
+      - name: Check model context and financial evidence
+        run: |
+          npm run test:context-budget
+          node --unhandled-rejections=strict "$RUNNER_TEMP/context-budget.mjs" .
+          node .ci-qa/handoff/qa/financial-evidence.mjs .
+      - name: Verify TCP, restart and Chromium delivery
+        if: ${{ !cancelled() && steps.runtimes.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build:copilot-pilot
+          npm run test:turn-delivery | tee "$RUNNER_TEMP/turn.log"
+          grep -F "a new server process reloads delivered turn records over TCP" "$RUNNER_TEMP/turn.log"
+          grep -F "Chrome interleaved framework edits keep each session's verdict through process restart" "$RUNNER_TEMP/turn.log"
+      - name: Verify workbooks, financial claims and research review
+        if: ${{ !cancelled() && steps.runtimes.outcome == 'success' }}
+        run: |
+          npm run test:research
+          npm run test:systemic
+          npm run test:fact-memory
+      - name: Verify framework rendering, approvals and browser flows
+        if: ${{ !cancelled() && steps.runtimes.outcome == 'success' }}
+        run: |
+          npm run test:framework
+          npm run test:presentation
+          npm run test:presentation:browser
+          npm run test:approvals
+          npm run test:e2e
