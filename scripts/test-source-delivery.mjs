@@ -79,7 +79,12 @@ async function run(question, searches, text, budgetStop = false) {
           errorMessage: '来源核验模型预算耗尽',
         });
       } else
-        this.messages.push({role: 'assistant', content: text, stopReason: 'stop', timestamp: Date.now()});
+        this.messages.push({
+          role: 'assistant',
+          content: Array.isArray(text) ? text[Math.min(prompts, text.length) - 1] : text,
+          stopReason: 'stop',
+          timestamp: Date.now(),
+        });
     },
   };
   const entry = {session, id: 'session'};
@@ -120,6 +125,16 @@ test('budget recovery publishes one verified unique source and separately record
   const missing = await run(history, [], '', true);
   assert.equal(missing.record.status, 'failed');
   assert.ok(!missing.rows.some((r) => r.type === 'pe_source_host_repair'));
+});
+
+test('an empty correction can recover the checked source without publishing a replaced draft', async () => {
+  const first = report + '。\n\n当前材料版本为 v5。';
+  const second = '第1轮正式回答引用的是 [Else.xlsx]Model!A3。';
+  const result = await run(history, [{query, turn: 1}], [first, second]);
+  assert.equal(result.record.status, 'completed', result.record.reason);
+  assert.ok(result.record.text.includes(original.id));
+  assert.ok(!result.record.text.includes('v5') && !result.record.text.includes('Else.xlsx'));
+  assert.equal(result.rows.filter((r) => r.type === 'pe_source_host_repair').length, 1);
 });
 
 test('a verified result for X does not satisfy the missing query Y', async () => {

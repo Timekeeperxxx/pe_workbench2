@@ -117,22 +117,23 @@ async function generateAnswer(entry, promptText, options, active) {
   let continuationCount = 0;
   let safeText = '';
   let safeCitations = [];
+  function repairFromObservations(kind,reason,observations,lint,before) {
+    const recovered=recoverSourceFields(active.plan,observations);
+    if (!recovered) return;
+    const {hostRepair,rejected,rejectedChecks,optionalNotes,...decision}=evaluateSourceDraft({
+      text:recovered,question:text,plan:active.plan,observations,currentVersions:{},lint,repairId:false,
+    });
+    if (decision.status!=='completed' || rejected.length) return;
+    appendTurnMarker(entry.session,'pe_source_host_repair',{turnId,kind,reason:failureReason(reason),
+      before:digest(before),after:decision.sourceDelivery.textDigest,callIds:decision.sourceDelivery.claims.flatMap(c=>c.callIds)});
+    return decision;
+  }
   const interrupted = reason => {
-    if (!active.cancelled && active.sourceBudgetStop && !safeText && active.admitted) {
+    if (!active.cancelled && active.sourceBudgetStop && active.admitted) {
       const observations=sourceObservations(active.plan,scannedTurnTools(entry.session,turnBoundary),toolCalls,entry.ctx?.store);
-      const recovered=recoverSourceFields(active.plan,observations);
-      if (recovered) {
-        const {hostRepair,rejected,rejectedChecks,optionalNotes,...decision}=evaluateSourceDraft({
-          text:recovered,question:text,plan:active.plan,observations,currentVersions:{},
-          lint:(part,pool)=>lintAnswer(part,{question:text,citations:pool,locatorCitations:pool}),repairId:false,
-        });
-        if (decision.status==='completed' && !rejected.length) {
-          appendTurnMarker(entry.session,'pe_source_host_repair',{turnId,reason:failureReason(reason),
-            kind:'verifiedFieldsAfterBudgetStop',before:digest(safeText),after:decision.sourceDelivery.textDigest,
-            callIds:decision.sourceDelivery.claims.flatMap(c=>c.callIds)});
-          return decision;
-        }
-      }
+      const repaired=repairFromObservations('verifiedFieldsAfterBudgetStop',reason,observations,
+        (part,pool)=>lintAnswer(part,{question:text,citations:pool,locatorCitations:pool}),safeText);
+      if (repaired) return repaired;
     }
     return {...(active.safeDecision||{}),status:active.cancelled?'cancelled':safeText?'partial':'failed',
       text:safeText,citations:safeCitations,reason:failureReason(reason)};
@@ -294,6 +295,11 @@ async function generateAnswer(entry, promptText, options, active) {
             message:'来源陈述与当前可用证据不符'})),messageIndex:entry.session.messages.lastIndexOf(message)};
         appendTurnMarker(entry.session,'pe_answer_lint',lintRecord);
         entry.answerLint=lintRecord;
+        if (!active.cancelled && correctionCount && !decision.text && safeText && safeCitations.length) {
+          const repaired=repairFromObservations('verifiedFieldsAfterEmptyCorrection','纠错稿未保留已取得的出处。',
+            observations,scopedLint,answer);
+          if (repaired) return repaired;
+        }
         safeText=decision.text;
         safeCitations=decision.citations;
         active.safeDecision=decision;
