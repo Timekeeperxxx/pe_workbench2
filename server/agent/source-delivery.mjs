@@ -354,6 +354,7 @@ export function evaluateSourceDraft({
     occurrences = [],
     rejected = [],
     optionalNotes = [],
+    statedLimits = [],
     rejectedChecks = [],
     citations = new Map();
   let body = '',
@@ -407,6 +408,7 @@ export function evaluateSourceDraft({
     const named = decisions.filter((i) => i.query && s.toLowerCase().includes(i.query.toLowerCase()));
     const selected = named.length ? named : decisions;
     if (/^(?:[-*] )?未核验[：:]/.test(s) && !/^未核验[：:]\s*无[。.]?$/.test(s)) {
+      statedLimits.push(s);
       gaps.push(s);
       continue;
     }
@@ -841,5 +843,6 @@ export function evaluateSourceDraft({
     rejected,
     rejectedChecks,
     optionalNotes,
+    statedLimits,
   };
 }

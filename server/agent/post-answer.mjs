@@ -120,7 +120,7 @@ async function generateAnswer(entry, promptText, options, active) {
   function repairFromObservations(kind,reason,observations,lint,before) {
     const recovered=recoverSourceFields(active.plan,observations);
     if (!recovered) return;
-    const {hostRepair,rejected,rejectedChecks,optionalNotes,...decision}=evaluateSourceDraft({
+    const {hostRepair,rejected,rejectedChecks,optionalNotes,statedLimits,...decision}=evaluateSourceDraft({
       text:recovered,question:text,plan:active.plan,observations,currentVersions:{},lint,repairId:false,
     });
     if (decision.status!=='completed' || rejected.length) return;
@@ -281,10 +281,10 @@ async function generateAnswer(entry, promptText, options, active) {
         };
         const evaluated=evaluateSourceDraft({text:answer,question:text,plan:active.plan,observations,currentVersions:sourceVersions,
           meaning,review:active.reviewed,lint:scopedLint});
-        const {hostRepair,rejected,rejectedChecks,optionalNotes,...decision}=evaluated;
+        const {hostRepair,rejected,rejectedChecks,optionalNotes,statedLimits,...decision}=evaluated;
         const incomplete = message.stopReason==='length' || (observations.items.some(i=>i.hits.length || i.related.length) && lintAnswer(answer,lintContext).some(f=>f.rule==='incomplete' &&
           !(f.message==='句末可能截断' && (decision.sourceDelivery.items.some(i=>i.fieldsDelivered.includes('id')) || /未核验[：:]无$/.test(answer)))));
-        const trace={turnId,rejectedChecks,optionalNotes,attempt:correctionCount+continuationCount,raw:active.rawDrafts.slice(),meaning:meaning?.claims,requests:active.budget?.requests,languageErrors:active.languageErrors,reviewed:digest(delta),
+        const trace={turnId,rejectedChecks,optionalNotes,statedLimits,attempt:correctionCount+continuationCount,raw:active.rawDrafts.slice(),meaning:meaning?.claims,requests:active.budget?.requests,languageErrors:active.languageErrors,reviewed:digest(delta),
           assembled:digest(joined),presented:digest(answer),final:decision.sourceDelivery.textDigest,
           correctionCount,continuationCount,hostRepair,stopReason:message.stopReason};
         appendTurnMarker(entry.session,'pe_source_observation',{turnId,attempts:observations.attempts.map(({details,...c})=>c),
@@ -295,6 +295,21 @@ async function generateAnswer(entry, promptText, options, active) {
             message:'来源陈述与当前可用证据不符'})),messageIndex:entry.session.messages.lastIndexOf(message)};
         appendTurnMarker(entry.session,'pe_answer_lint',lintRecord);
         entry.answerLint=lintRecord;
+        // A model can volunteer another investigation after delivering the
+        // requested source. Only the admitted obligations determine coverage.
+        // Verify the preserved natural text a second time without the proposed
+        // extra work. Record this change as a host edit, never as a verbatim draft.
+        if (!active.cancelled && !incomplete && !rejected.length && statedLimits.length &&
+            decision.status==='partial' && decision.sourceDelivery.items.every(i=>i.state==='answered') &&
+            !active.plan.gaps.length && !observations.recoveryGaps.length && recoverSourceFields(active.plan,observations)) {
+          const reviewed=evaluateSourceDraft({text:decision.text,question:text,plan:active.plan,observations,
+            currentVersions:sourceVersions,meaning,lint:scopedLint,repairId:false});
+          if (reviewed.status==='completed' && !reviewed.rejected.length) {
+            appendTurnMarker(entry.session,'pe_source_host_repair',{turnId,kind:'requestedFieldsReverified',
+              before:digest(answer),after:reviewed.sourceDelivery.textDigest,statedLimits});
+            return {...decision,status:'completed',reason:undefined,sourceDelivery:reviewed.sourceDelivery};
+          }
+        }
         if (!active.cancelled && correctionCount && !decision.text && safeText && safeCitations.length) {
           const repaired=repairFromObservations('verifiedFieldsAfterEmptyCorrection','纠错稿未保留已取得的出处。',
             observations,scopedLint,answer);

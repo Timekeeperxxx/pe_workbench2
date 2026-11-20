@@ -127,6 +127,21 @@ test('budget recovery publishes one verified unique source and separately record
   assert.ok(!missing.rows.some((r) => r.type === 'pe_source_host_repair'));
 });
 
+test('the model cannot add a new unresolved request after all requested source fields are delivered', async () => {
+  const {record, rows} = await run(
+    history,
+    [{query, turn: 1}],
+    report + '。\n\n未核验：今天的工作副本是否仍是 v1。',
+  );
+  assert.equal(record.status, 'completed', record.reason);
+  assert.ok(record.text.includes(original.id));
+  assert.ok(!record.text.includes('工作副本'));
+  assert.ok(rows.some((r) => r.data.kind === 'requestedFieldsReverified'));
+  const missing = await run(multiple, [{query, turn: 1}], report + '。\n\n未核验：第二项。');
+  assert.equal(missing.record.status, 'partial');
+  assert.ok(!missing.rows.some((r) => r.data.kind === 'requestedFieldsReverified'));
+});
+
 test('an empty correction can recover the checked source without publishing a replaced draft', async () => {
   const first = report + '。\n\n当前材料版本为 v5。';
   const second = '第1轮正式回答引用的是 [Else.xlsx]Model!A3。';
