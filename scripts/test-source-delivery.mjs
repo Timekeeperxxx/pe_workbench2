@@ -5,7 +5,8 @@ import {createTranscriptSearchTool} from '../lib/transcript-search-tool.mjs';
 import {sourceObservations} from '../server/agent/source-observations.mjs';
 import {evaluateSourceDraft} from '../server/agent/source-delivery.mjs';
 import {lintLedgerAnswer} from '../lib/answer-lint.mjs';
-import {prepareSourcePlan, assertionQuestion} from '../server/agent/source-plan.mjs';
+import {sourceModelOptions} from '../server/agent/source-provider.mjs';
+import {prepareSourcePlan, assertionQuestion, modelPlan, digest} from '../server/agent/source-plan.mjs';
 import {projectSourceEvent} from '../lib/source-reader.mjs';
 import {transcriptMessages} from '../server/agent/snapshot.mjs';
 
@@ -267,6 +268,125 @@ test('R2 one turn proves X, exhaustive Y zero, and current read with independent
   ).record;
   assert.deepEqual([damaged.citations, damaged.sourceDelivery.occurrences], [[], []]);
 });
+test('verified field values and observed search counts survive a different field layout', () => {
+  function decide(note, fields, relation = 'historical', extraCalls = []) {
+    const text = report + '\n\n' + note;
+    const observations = sourceObservations(sourcePlan, [activeSearch, ...extraCalls], []);
+    return evaluateSourceDraft({
+      text,
+      question: history,
+      plan: sourcePlan,
+      observations,
+      currentVersions: {[materialId]: 2},
+      meaning: {
+        claims: [
+          ...report
+            .split('\n\n')
+            .map((quote) => ({quote, relation: 'historical', polarity: 'positive', fields: []})),
+          {quote: note, relation, polarity: 'positive', fields},
+        ],
+      },
+    });
+  }
+  const joint = '材料 ID 和版本：' + materialId + '，v1';
+  const fields = [
+    {name: 'materialId', literal: materialId},
+    {name: 'version', literal: 'v1'},
+  ];
+  assert.equal(decide(joint, fields).status, 'completed');
+  assert.equal(decide(joint.replace('v1', 'v2'), fields).status, 'partial');
+  const zero = '本次工作簿实读 0 次。';
+  const evidence = [{name: 'directReadCount', literal: '0', value: 0}];
+  assert.equal(decide(zero, evidence, 'execution').status, 'completed');
+  assert.equal(decide(zero, evidence, 'execution', [observation('read', 'other', {}, {})]).status, 'partial');
+  assert.equal(decide(zero.replace('0', '7'), evidence, 'execution').status, 'partial');
+});
+
+test('a research receipt proves only the audited text and cannot complete a missing source', () => {
+  const historical = report.split('\n\n')[0],
+    financial = '本轮报告依据 Model!B2，值为 942。';
+  const plan = {
+    ...sourcePlan,
+    items: [
+      {...sourcePlan.items[0], fields: []},
+      {id: 'report', action: 'review', requiresSave: true},
+    ],
+  };
+  const read = observation('workbook_query', 'report-read', {query: 'Model!B2'}, {citations: [current]});
+  const text = [historical, financial].join('\n\n');
+  const meaning = {
+    claims: [
+      {quote: historical, relation: 'historical', polarity: 'positive'},
+      {quote: financial, relation: 'financial', polarity: 'positive'},
+    ],
+  };
+  const decide = (calls, review) =>
+    evaluateSourceDraft({
+      text,
+      question: history,
+      plan,
+      meaning,
+      review,
+      observations: sourceObservations(plan, calls, []),
+      currentVersions: {[materialId]: 2},
+    });
+  const review = {digest: digest(text), written: true, pending: [], openFindings: []};
+  assert.equal(decide([activeSearch, read], review).status, 'completed');
+  assert.equal(decide([read], review).status, 'partial');
+  for (const wrong of [
+    {written: false},
+    {digest: digest(financial)},
+    {openFindings: [{excerpt: '值为 942'}]},
+  ]) {
+    const result = decide([activeSearch, read], {...review, ...wrong});
+    assert.equal(result.status, 'partial');
+    assert.ok(!result.text.includes('942'));
+  }
+});
+
+test('the provider receipt distinguishes final evidence fields, a handle-only projection and an omitted row', async () => {
+  const active = {
+    turnId: 'T2',
+    admitted: true,
+    controller: new AbortController(),
+    plan: {...sourcePlan, route: 'history', branch: 'b'},
+    question: history,
+    rawDrafts: [],
+  };
+  active.planProjection = modelPlan(active.plan);
+  const tool = createTranscriptSearchTool({
+    getMessages: () => [
+      {role: 'user', content: '请看工作簿'},
+      {...formalHit, content: sourceText},
+    ],
+    getActive: () => active,
+  });
+  const result = await tool.execute('X', {query, turn: 1});
+  const row = result.details.sourceEvidence[0];
+  assert.deepEqual(row.itemIds, ['X']);
+  const body = (value) => ({
+    tools: [],
+    messages: [
+      {role: 'user', content: active.planProjection},
+      {role: 'tool', tool_call_id: 'X', content: JSON.stringify({sourceEvidence: value})},
+    ],
+  });
+  const invoke = async (value) => {
+    const o = sourceModelOptions(active, {id: 'fixture', maxTokens: 1024}, {}, null);
+    await o.onPayload(body(value));
+    return active.budget.requests.at(-1);
+  };
+  assert.ok((await invoke([row])).visible[0].fields.includes('id'));
+  assert.deepEqual((await invoke([{handle: row.handle}])).visible[0].fields, ['handle']);
+  assert.equal((await invoke([])).visible[0].handleVisible, false);
+  const targeted = await tool.execute('follow', {query, handle: row.handle});
+  assert.equal(targeted.details.sourceEvidence[0].id, original.id);
+  active.plan = {...active.plan, rev: 2};
+  assert.equal((await tool.execute('stale', {query, handle: row.handle})).isError, true);
+  active.controller.abort();
+  assert.throws(() => sourceModelOptions(active, {id: 'fixture'}, {}, null));
+});
+
 test('visible negative historical assertion and a new corporate claim cannot inherit a true source', async () => {
   for (const text of [
     report.replace('出处是', '出处并非'),

@@ -49,6 +49,7 @@ export function sourceObservations(plan, scanned, live, catalog) {
       const details = call.result?.details ?? call.details;
       const fingerprint = digest(JSON.stringify([state, details ?? null]));
       const observation = {
+        startedAt: call.startedAt ?? null,
         finishedAt: call.finishedAt ?? call.result?.timestamp ?? null,
         id: call.id,
         name: call.name,
@@ -249,5 +250,6 @@ export function sourceObservations(plan, scanned, live, catalog) {
     if (!recovered)
       recoveryGaps.push('未能核实工具读取：' + attempt.name + ' ' + (attempt.args.path ?? attempt.id));
   }
-  return {attempts, witnesses: eligible, items, badIds: [...badIds], recoveryGaps};
+  const historyToolsOnly=[...scanned,...live].every(c=>c.name==='transcript_search');
+  return {attempts, witnesses: eligible, items, badIds: [...badIds], recoveryGaps, historyToolsOnly};
 }

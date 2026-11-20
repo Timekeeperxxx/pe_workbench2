@@ -275,6 +275,8 @@ export function createSessionService({
       if (veto) return veto;
       if (entry?.activeTurn?.sourceSchema && !entry.activeTurn.admitted) return {block:true,reason:'回合请求范围尚未持久化'};
       const plan=entry?.activeTurn?.plan;
+      const offered=entry?.activeTurn?.offeredSourceTools;
+      if (offered && !offered.has(toolCall.name)) return {block:true,reason:`本次来源请求没有提供工具 ${toolCall.name}。请根据已登记事项及本轮工具结果回答。`};
       const read=plan?.items.find(i=>i.action==='read' && i.conditional);
       if (read && ['workbook_query','workbook_trace'].includes(toolCall.name)) {
         const observed=sourceObservations(plan,[],entry.turnToolCalls??[],ctx.store);

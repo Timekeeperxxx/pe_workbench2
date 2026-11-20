@@ -52,6 +52,31 @@ export function assertionQuestion(question, plan) {
   return chars.join('');
 }
 
+export function modelPlan(plan) {
+  if (plan.route === 'ordinary') return null;
+  return JSON.stringify({
+    revision: plan.rev,
+    items: plan.items.map((i) => ({
+      id: i.id,
+      action: i.action,
+      ...(i.action === 'search'
+        ? {
+            tool: 'transcript_search',
+            args: {
+              ...(i.query ? {query: i.query} : {}),
+              ...(i.turn != null ? {turn: i.turn} : {}),
+            },
+            role: 'assistant',
+            material: i.book ?? undefined,
+          }
+        : {}),
+      fields: i.fields,
+      condition: i.conditional ? i.predicate : undefined,
+    })),
+    unresolved: plan.gaps,
+  });
+}
+
 const normalize = (s) => s.trim().toLowerCase().replace(/\s+/g, ' ');
 export async function prepareSourcePlan(active, entry) {
   const question = active.question;

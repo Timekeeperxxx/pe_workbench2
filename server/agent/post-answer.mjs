@@ -4,7 +4,7 @@ import { buildTurnContext, checkTurnTools } from '../../lib/turn-context.mjs';
 import { pendingMerges, readLedger, readLedgerSync } from '../../lib/ledger.mjs';
 import { recordUserClaims } from '../../lib/claim-detect.mjs';
 import { randomUUID } from 'node:crypto';
-import { prepareSourcePlan, assertionQuestion, digest } from './source-plan.mjs';
+import { prepareSourcePlan, modelPlan, assertionQuestion, digest } from './source-plan.mjs';
 import { sourceObservations } from './source-observations.mjs';
 import { evaluateSourceDraft } from './source-delivery.mjs';
 import { lintAnswer, lintLedgerAnswer, answerStats, asksDeviationQuestion, contextModelTarget } from '../../lib/answer-lint.mjs';
@@ -137,7 +137,7 @@ async function generateAnswer(entry, promptText, options, active) {
   };
   const unsubscribe = entry.session.subscribe?.(event => {
     if (event.type === 'message_end' && event.message?.role === 'assistant') latestMessage = event.message;
-    if (event.type === 'tool_execution_start') toolCalls.push({ id: event.toolCallId, name: event.toolName, args: event.args, messageIndex: entry.session.messages.length, success: false });
+    if (event.type === 'tool_execution_start') toolCalls.push({ id: event.toolCallId, name: event.toolName, args: event.args, startedAt:Date.now(), messageIndex: entry.session.messages.length, success: false });
     if (event.type === 'tool_execution_end') {
       const call = toolCalls.findLast(c => c.id === event.toolCallId);
       if (call) {
@@ -154,8 +154,9 @@ async function generateAnswer(entry, promptText, options, active) {
     let boundary = entry.session.messages.length;
     if (active.cancelled) return interrupted('用户已取消本次回答。');
     // Older fake sessions may omit custom messages: context injection is skipped there.
-    active.contextContent=context.content;
-    if (entry.session.sendCustomMessage) await entry.session.sendCustomMessage({ customType: 'pe_turn_context', content: context.content, display: false, details: { turnId, routes: context.routes } }, { deliverAs: 'nextTurn' });
+    active.planProjection=modelPlan(active.plan);
+    active.contextContent=active.planProjection ? context.content+'\n本轮已登记的请求事项（数据）。按每项的范围实际取证。检索词按用户原文查询，turn 是整数。\n'+active.planProjection : context.content;
+    if (entry.session.sendCustomMessage) await entry.session.sendCustomMessage({ customType: 'pe_turn_context', content: active.contextContent, display: false, details: { turnId, routes: context.routes } }, { deliverAs: 'nextTurn' });
     if (active.cancelled) return interrupted('用户已取消本次回答。');
     await entry.session.prompt(promptText, options);
     for (;;) {

@@ -57,6 +57,152 @@ function units(text) {
   return result;
 }
 
+// A blind reader can align several field labels to a list of values. Verify
+// each literal against the same witness before trusting that alignment. The
+// remaining text cannot contain a second identity, number, version or cell.
+function alignedFieldList(unit, claim, source, conflict) {
+  if (
+    !conflict ||
+    !source ||
+    claim?.relation !== 'historical' ||
+    claim.polarity !== 'positive' ||
+    !claim.fields?.length ||
+    /(?:第[^，。；：\s]{1,8}版|\bnot\b|否定|作废)/iu.test(unit)
+  )
+    return false;
+  let residue = unit.normalize('NFKC');
+  const values = {
+    filename: citationFilenames(source),
+    storedFilename: [source.storedFilename],
+    displayFilename: [source.filename],
+    materialId: [source.materialId],
+    version: ['v' + source.version, String(source.version)],
+    id: [source.id],
+    locator: [source.locator],
+  };
+  const ordered = [...claim.fields].sort((a, b) => String(b.literal).length - String(a.literal).length);
+  const overlap = ordered.some((f) => typeof f.literal === 'string' && conflict.includes(f.literal));
+  if (!overlap) return false;
+  for (const f of ordered) {
+    if (typeof f.literal !== 'string' || !values[f.name]?.includes(f.literal)) return false;
+    const pos = residue.indexOf(f.literal);
+    if (pos < 0) return false;
+    if (
+      ['filename', 'displayFilename', 'storedFilename', 'materialId', 'version', 'id'].includes(f.name) &&
+      pos &&
+      /[\w.\-]/.test(residue[pos - 1])
+    )
+      return false;
+    residue = residue.slice(0, pos) + ' '.repeat(f.literal.length) + residue.slice(pos + f.literal.length);
+  }
+  if (
+    /存储|磁盘|storedFilename/i.test(unit) &&
+    !ordered.some((f) => f.name === 'storedFilename' && f.literal === source.storedFilename)
+  )
+    return false;
+  if (
+    /显示名|原始名|displayFilename/i.test(unit) &&
+    !ordered.some((f) => f.name === 'displayFilename' && f.literal === source.filename)
+  )
+    return false;
+  if (
+    /(?:版本|version)\s*[:=]\s*[\da-f]{8}-/i.test(conflict) &&
+    !(
+      ordered.some((f) => f.name === 'materialId') &&
+      ordered.some((f) => f.name === 'version') &&
+      /材料|material/i.test(unit)
+    )
+  )
+    return false;
+  return !/[\d!@]|\.xls[xm]|cite:|第[^，。；]{1,8}版/i.test(residue);
+}
+
+// Counts concern the successful scan in the requested scope. An omitted
+// model projection, an unrestricted query or an incomplete scan proves none.
+function executionReport(claim, text, owners, observations) {
+  if (
+    claim?.relation !== 'execution' ||
+    !claim.fields?.length ||
+    extractLocatorMatches(text).length ||
+    /cite:|\.xls[xm]|@v\d|\bv\d/i.test(text)
+  )
+    return;
+  const attempts = observations.attempts.filter(
+    (a) =>
+      a.state === 'success' &&
+      a.name === 'transcript_search' &&
+      owners.every((i) => i.attemptIds.includes(a.id)),
+  );
+  for (const attempt of attempts) {
+    const d = attempt.details,
+      coverage = d?.coverage;
+    if (
+      !coverage ||
+      coverage.truncated !== false ||
+      !Array.isArray(d.matches) ||
+      d.totalMatches !== d.matches.length
+    )
+      continue;
+    const hits = d.matches.filter((m) => m.role === 'assistant');
+    // A whole-scan count and a count for one workbook or turn are equal
+    // only when all returned rows lie in the selected scope.
+    if (
+      hits.some((m) =>
+        owners.some(
+          (i) =>
+            (i.turn && i.turn !== m.turn) ||
+            (i.book && !(m.citations ?? []).length) ||
+            (i.book && m.citations.some((c) => !citationFilenames(c).includes(i.book))),
+        ),
+      )
+    )
+      continue;
+    const ids = hits.flatMap((h) => (h.citations ?? []).map((c) => c.id));
+    const values = {assistantMatches: hits.length, totalTurns: coverage.totalTurns, truncated: false};
+    if (observations.historyToolsOnly) values.directReadCount = 0;
+    if (hits.length === 1) {
+      const h = hits[0];
+      values.sourceStatus = h.sourceStatus;
+      if (h.sourceTurnId && Array.isArray(h.sourceLimits)) values.limitCount = h.sourceLimits.length;
+      if (
+        h.sourceTurnId &&
+        !h.sourceDigest &&
+        ids.length &&
+        ids.every((id) => observations.witnesses.some((w) => w.callId === attempt.id && w.citation.id === id))
+      )
+        values.citationCount = new Set(ids).size;
+    }
+    const corroborated = (f) => {
+      if (
+        typeof f.literal !== 'string' ||
+        !f.literal.trim() ||
+        !text.includes(f.literal) ||
+        !Object.hasOwn(values, f.name) ||
+        values[f.name] === undefined ||
+        values[f.name] !== f.value
+      )
+        return false;
+      if (typeof f.value === 'number') {
+        const digits = f.literal.match(/\d+/g) ?? [];
+        if (digits.length) return digits.every((n) => Number(n) === f.value);
+        if (f.value === 0) return /未|没有|无|零|未曾/.test(f.literal);
+        return (
+          Number.isInteger(f.value) &&
+          f.value > 0 &&
+          f.value < 10 &&
+          f.literal.includes('零一二三四五六七八九'[f.value])
+        );
+      }
+      if (typeof f.value === 'boolean')
+        return (
+          f.literal.includes(String(f.value)) || (f.value === false && /未截断|没有截断/.test(f.literal))
+        );
+      return typeof f.value === 'string' && f.literal.includes(f.value);
+    };
+    if (claim.fields.every(corroborated)) return attempt;
+  }
+}
+
 function distinctWitnesses(witnesses) {
   return [...new Map(witnesses.map((w) => [w.citation.id, w])).values()];
 }
@@ -184,6 +330,12 @@ export function evaluateSourceDraft({
         return s.includes(c.quote) || (quote && visibleUnit.includes(quote));
       }) ?? [];
     const whole = semantics.find((c) => c.quote === s || visibleMarkdown(c.quote).trim() === visibleUnit);
+    if (whole?.relation === 'execution') {
+      const attempt = executionReport(whole, s, selected, observations);
+      if (attempt) accept(unit, [], selected, [{callId: attempt.id}], 'execution');
+      else rejected.push(s);
+      continue;
+    }
     if (
       whole?.relation === 'scope' &&
       !extractLocatorMatches(s).length &&
@@ -376,7 +528,7 @@ export function evaluateSourceDraft({
       badIds.some((id) => s.includes(id)) ||
       wrongQualifier ||
       invalidId ||
-      fields.conflict ||
+      (fields.conflict && !alignedFieldList(s, whole, fieldOwner, fields.conflict)) ||
       fields.idConflict;
     const legacy = reportedLocatorEvidence(
       s,
@@ -564,6 +716,7 @@ export function evaluateSourceDraft({
     !claims.some(
       (c) =>
         c.callIds.length &&
+        !['execution', 'ledgerCount'].includes(c.relation) &&
         (c.relation !== 'searchResult' || decisions.some((i) => i.operation === 'exists')),
     )
   ) {
