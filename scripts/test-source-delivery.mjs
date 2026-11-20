@@ -4,7 +4,8 @@ import {runWithPostAnswer} from '../server/agent/post-answer.mjs';
 import {createTranscriptSearchTool} from '../lib/transcript-search-tool.mjs';
 import {sourceObservations} from '../server/agent/source-observations.mjs';
 import {evaluateSourceDraft} from '../server/agent/source-delivery.mjs';
-import {prepareSourcePlan} from '../server/agent/source-plan.mjs';
+import {lintLedgerAnswer} from '../lib/answer-lint.mjs';
+import {prepareSourcePlan, assertionQuestion} from '../server/agent/source-plan.mjs';
 import {projectSourceEvent} from '../lib/source-reader.mjs';
 import {transcriptMessages} from '../server/agent/snapshot.mjs';
 
@@ -124,6 +125,17 @@ test('exhaustive empty discharges a conditional current read; unexecuted search 
 test('ordinary answer remains deliverable without a historical query', async () => {
   const {record} = await run('用一句话解释折旧。', [], '折旧是对资产可折旧金额的系统分摊。');
   assert.equal(record.status, 'completed');
+  const plan = await prepareSourcePlan(
+    {turnId: 'T', question: '请给出两个单元格的出处。'},
+    {
+      id: 'session',
+      session: {},
+      readSourceLanguage: () => {
+        throw Error('ordinary answer routed to historical reader');
+      },
+    },
+  );
+  assert.equal(plan.route, 'ordinary');
 });
 
 function observation(name, id, args, details, failed = false) {
@@ -149,7 +161,13 @@ const activeSearch = observation(
   {query, turn: 1},
   {matches: [formalHit], totalMatches: 1, coverage: {turnsScanned: 1, turns: [1], truncated: false}},
 );
-const current = {...original, id: original.id.replace(':v1:', ':v2:'), version: 2, value: 942};
+const current = {
+  ...original,
+  id: original.id.replace(':v1:', ':v2:'),
+  version: 2,
+  value: 942,
+  basis_type: 'unknown',
+};
 
 test('observe terminal failure, per-cell partial, duplicate observations and identity conflicts before deduplication', () => {
   const row = observation('workbook_query', 'read-2', {}, {citations: [current]});
@@ -215,6 +233,12 @@ test('R2 one turn proves X, exhaustive Y zero, and current read with independent
       plan,
       observations,
       currentVersions: {[materialId]: head},
+      lint: (part, pool) =>
+        lintLedgerAnswer(
+          part,
+          {},
+          {question: assertionQuestion(question, plan), citations: pool, locatorCitations: pool},
+        ),
       meaning,
     });
   }

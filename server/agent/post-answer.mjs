@@ -4,7 +4,7 @@ import { buildTurnContext, checkTurnTools } from '../../lib/turn-context.mjs';
 import { pendingMerges, readLedger, readLedgerSync } from '../../lib/ledger.mjs';
 import { recordUserClaims } from '../../lib/claim-detect.mjs';
 import { randomUUID } from 'node:crypto';
-import { prepareSourcePlan, digest } from './source-plan.mjs';
+import { prepareSourcePlan, assertionQuestion, digest } from './source-plan.mjs';
 import { sourceObservations } from './source-observations.mjs';
 import { evaluateSourceDraft } from './source-delivery.mjs';
 import { lintAnswer, lintLedgerAnswer, answerStats, asksDeviationQuestion, contextModelTarget } from '../../lib/answer-lint.mjs';
@@ -154,6 +154,7 @@ async function generateAnswer(entry, promptText, options, active) {
     let boundary = entry.session.messages.length;
     if (active.cancelled) return interrupted('用户已取消本次回答。');
     // Older fake sessions may omit custom messages: context injection is skipped there.
+    active.contextContent=context.content;
     if (entry.session.sendCustomMessage) await entry.session.sendCustomMessage({ customType: 'pe_turn_context', content: context.content, display: false, details: { turnId, routes: context.routes } }, { deliverAs: 'nextTurn' });
     if (active.cancelled) return interrupted('用户已取消本次回答。');
     await entry.session.prompt(promptText, options);
@@ -244,19 +245,20 @@ async function generateAnswer(entry, promptText, options, active) {
           const id=w.citation.materialId;
           sourceVersions[id]=entry.ctx.store.getVersionRow(id)?.version?.v ?? null;
         }
+        const claimQuestion=assertionQuestion(text,active.plan);
         const scopedLint=(part,pool)=>{
-          const checks={...lintContext,locatorCitations:pool};
+          const checks={...lintContext,question:claimQuestion,locatorCitations:pool};
           const local=lintAnswer(part,checks);
-          return [...local,...lintFactIdentity(part,entry.ctx?.factMemory,{question:text}),
+          return [...local,...lintFactIdentity(part,entry.ctx?.factMemory,{question:claimQuestion}),
             ...lintLedgerAnswer(part,refreshedLedger,{...checks,locatorFindings:local.filter(f=>f.rule==='unverified_locator')}),
             ...checkTurnTools({answer:part,routes:context.routes,toolCalls:calls})];
         };
         const evaluated=evaluateSourceDraft({text:answer,question:text,plan:active.plan,observations,currentVersions:sourceVersions,
           meaning,review:active.reviewed,lint:scopedLint});
-        const {hostRepair,rejected,...decision}=evaluated;
+        const {hostRepair,rejected,rejectedChecks,...decision}=evaluated;
         const incomplete = message.stopReason==='length' || (observations.items.some(i=>i.hits.length || i.related.length) && lintAnswer(answer,lintContext).some(f=>f.rule==='incomplete' &&
           !(f.message==='句末可能截断' && (decision.sourceDelivery.items.some(i=>i.fieldsDelivered.includes('id')) || /未核验[：:]无$/.test(answer)))));
-        const trace={turnId,attempt:correctionCount+continuationCount,raw:active.rawDrafts.slice(),meaning:meaning?.claims,requests:active.budget?.requests,languageErrors:active.languageErrors,reviewed:digest(delta),
+        const trace={turnId,rejectedChecks,attempt:correctionCount+continuationCount,raw:active.rawDrafts.slice(),meaning:meaning?.claims,requests:active.budget?.requests,languageErrors:active.languageErrors,reviewed:digest(delta),
           assembled:digest(joined),presented:digest(answer),final:decision.sourceDelivery.textDigest,
           correctionCount,continuationCount,hostRepair,stopReason:message.stopReason};
         appendTurnMarker(entry.session,'pe_source_observation',{turnId,attempts:observations.attempts.map(({details,...c})=>c),

@@ -41,6 +41,17 @@ function inventory(question) {
   return {terms, books, asksHistory};
 }
 
+// Quoted historical search operands are data supplied to the search tool.
+export function assertionQuestion(question, plan) {
+  const chars = question.split('');
+  for (const item of plan.items) {
+    if (item.action !== 'search' || !item.query || !item.range) continue;
+    const [start, end] = item.range;
+    if (question.slice(start, end) === item.query) chars.fill(' ', start, end);
+  }
+  return chars.join('');
+}
+
 const normalize = (s) => s.trim().toLowerCase().replace(/\s+/g, ' ');
 export async function prepareSourcePlan(active, entry) {
   const question = active.question;
@@ -74,7 +85,7 @@ export async function prepareSourcePlan(active, entry) {
     !ambiguous &&
     !audited.asksHistory &&
     !proposal.length &&
-    !/以前|之前|方才|前面|当时|旧答|上文|两(?:个|项)|过去|earlier|previous/i.test(question);
+    !/以前|之前|方才|前面|当时|旧答|上文|过去|earlier|previous/i.test(question);
   plan.inventory = {rounds: scope, terms: audited.terms, books: audited.books, sourceRequest, plain};
   if (plain || (!sourceRequest && !ambiguous && !entry.readSourceLanguage)) return plan;
   let interpretation;
@@ -174,7 +185,14 @@ export async function prepareSourcePlan(active, entry) {
       typeof i.quote === 'string' &&
       i.quote &&
       question.includes(i.quote) &&
-      !hasCurrent,
+      !hasCurrent &&
+      // A request for fields of the cited source is already covered by the
+      // historical item. Keep an independently proposed file inspection open.
+      !(
+        sourceRequest &&
+        /(?:所|曾|当时)?引用(?:的|过的)|原出处/.test(i.quote) &&
+        !/读取|读回|打开|实读|核对(?:工作簿|原件)|read (?:the |from )?file/i.test(i.quote)
+      ),
   );
   if (unresolvedRead) gaps.push('原问包含尚未对齐的读取要求。');
   if (interpretation?.kind === 'pending') gaps.push('独立清点尚未确定原问的范围。');

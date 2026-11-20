@@ -337,9 +337,9 @@ await test("durable delivery through Workbench, Pi, legacy SSE and AG-UI replay"
   });
 });
 
-async function networkRequest(base, pathname, body, signal) {
+async function networkRequest(base, pathname, body, signal, exact = true) {
   const response = await fetch(base + pathname, {
-    headers: {"X-PE-Source-Links":"exact-v1", ...(body===undefined?{}:{"content-type":"application/json"})},
+    headers: {...(exact?{"X-PE-Source-Links":"exact-v1"}:{}), ...(body===undefined?{}:{"content-type":"application/json"})},
     method: body === undefined ? "GET" : "POST", signal,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
@@ -347,11 +347,11 @@ async function networkRequest(base, pathname, body, signal) {
   return response;
 }
 
-async function networkStream(t, base, pathname, body) {
+async function networkStream(t, base, pathname, body, exact = true) {
   const controller = new AbortController();
   const disconnect = () => controller.abort();
   t.after(disconnect);
-  const response = await networkRequest(base, pathname, body, controller.signal);
+  const response = await networkRequest(base, pathname, body, controller.signal, exact);
   assert.match(response.headers.get("content-type"), /text\/event-stream/);
   const frames = [];
   const done = (async () => {
@@ -753,6 +753,8 @@ sys.stdout.buffer.write(data.getvalue())
           const text='第1轮正式回答引用的是 [Acceptance13.xlsx]Model!B2（版本 v1）。\n\n完整 citation.id：'+citation+
             '\n\n第1轮“折旧政策”未命中。\n\n本次读取同一材料 v2 的 Model!B2，值为 942。';
           const prior=(await snapshot()).length;
+          const oldReader=await open(t,'legacy',base,false);
+          await oldReader.reload(id);
           const script=scriptModel(entry,[
             {toolName:'transcript_search',tool:{},toolId:'r2-failed',stopReason:'toolUse'},
             {toolName:'transcript_search',tool:{query:'最终稿B',turn:1},toolId:'r2-X',stopReason:'toolUse'},
@@ -763,7 +765,19 @@ sys.stdout.buffer.write(data.getvalue())
           t.after(script.resume);
           await ui.send(prompt);await bounded(script.paused,'source contract tools');const pending=entry.postAnswerRun;
           script.resume();const record=await bounded(pending,'source contract signing');
-          assert.deepEqual([record.status,record.text],['completed',text],JSON.stringify(record));
+          assert.deepEqual([record.status,record.text],['completed',text],JSON.stringify({record, checks:branch().findLast(r=>r.customType==='pe_source_draft')?.data?.rejectedChecks, tools:branch().map(r=>r.message).filter(m=>m?.toolCallId==='r2-current')}));
+          const checkOld=async()=>{
+            const body=await checkReply(oldReader,{...record,citations:[]},prior);
+            assert.equal(await body.locator('[data-cell-cite]').count(),0);
+            const group=answers(oldReader.page).nth(prior).locator('.tool-group');
+            if (!await group.evaluate(node=>node.open)) await group.locator(':scope > summary').click();
+            const hit=group.locator('[data-tool-call-id="r2-X"]');
+            await hit.getByText(citation,{exact:false}).waitFor();
+            assert.equal(await hit.locator('[data-cell-cite]').count(),0);
+            assert.match(await group.locator('[data-tool-call-id="r2-Y"]').innerText(),/历史问答未命中/);
+            assert.equal(await group.locator('.tool-row.error').count(),1);
+          };
+          await checkOld();
           const at=await checkReply(ui,record,prior);
           const buttons=at.locator('[data-cell-cite]');
           assert.deepEqual(await buttons.evaluateAll(nodes=>nodes.map(n=>n.dataset.version)),['1','2']);
@@ -771,6 +785,22 @@ sys.stdout.buffer.write(data.getvalue())
             await buttons.nth(i).click();await ui.page.waitForFunction(v=>document.querySelector('.xlsx-c.is-sel')?.innerText===v,value);
             assert.deepEqual(await ui.page.evaluate(()=>[state.openFileId,state.selectedVersion]),[sid,i+1]);
             await ui.page.locator('#dClose').click();
+          }
+          if (transport==='agui') {
+            const [firstEvent]=ctx.agentEvents.list({threadId:id,runId:record.runId});
+            const replays=await Promise.all([true,false].map(exact => networkStream(t,base,'/api/ag-ui/agent/pi/connect',
+              {threadId:id,afterEventId:firstEvent.eventId},exact)));
+            await bounded(Promise.all(replays.map(r=>r.done)),'same cursor source replay');
+            const [newFrames,oldFrames]=replays.map(r=>r.frames);
+            assert.deepEqual(oldFrames.map(f=>f.id),newFrames.map(f=>f.id));
+            for(const [index,frames] of [newFrames,oldFrames].entries()) {
+              const decision=frames.find(f=>f.data.name==='pe.turn_delivery').data.value;
+              assert.equal(decision.text,text);
+              assert.deepEqual(decision.citations.map(c=>c.version),index?[]:[1,2]);
+              const result=frames.find(f=>f.data.type==='TOOL_CALL_RESULT' && f.data.toolCallId==='r2-X');
+              const [hit]=JSON.parse(result.data.content).matches;
+              assert.deepEqual(hit.citations.map(c=>c.id),index?[]:[citation]);
+            }
           }
           const offered='第'+(prior+1)+'轮正式回答引用的是 [Acceptance13.xlsx]Model!B2（版本 v1），引用 ID 为 '+citation+'。';
           const next=scriptModel(entry,[{toolName:'transcript_search',tool:{query:citation,turn:prior+1},toolId:'r2-T3',stopReason:'toolUse'},
@@ -781,7 +811,9 @@ sys.stdout.buffer.write(data.getvalue())
           const match=result.matches.find(m=>m.sourceTurnId===record.turnId);
           assert.equal(match.sourceStatus,'completed');assert.ok(match.sourceClaims.some(c=>c.relation==='historical'));
           const nextRun=entry.postAnswerRun;next.resume();const third=await bounded(nextRun,'next source delivery');
-          assert.deepEqual([third.status,third.text],['completed',offered],JSON.stringify(third));
+          assert.deepEqual([third.status,third.text],['completed',offered],JSON.stringify({record:third,result,checks:branch().findLast(r=>r.customType==='pe_source_draft')?.data?.rejectedChecks}));
+          await oldReader.reload(id);
+          await checkOld();
           const legacy=await (await fetch(base+'/api/sessions/'+id+'/state')).json();
           const legacyCopy=legacy.messages.find(m=>m.turnId===record.turnId && m.role==='assistant');
           assert.deepEqual([legacyCopy.text,legacyCopy.citations],[text,[]]);
@@ -840,9 +872,16 @@ sys.stdout.buffer.write(data.getvalue())
 
 async function browserDeliveryTests(t, browser, app, base, json, restart) {
   const answers = page => page.locator("#thread .msg.assistant:not(#liveMsg)");
-  const open = async (t, transport, origin = base) => {
+  const open = async (t, transport, origin = base, exactLinks = true) => {
     const context = await browser.newContext();
     t.after(() => context.close());
+    if (!exactLinks) await context.route('**/api/**', route => {
+      const url = new URL(route.request().url());
+      url.searchParams.delete('sourceLinks');
+      const headers = {...route.request().headers()};
+      delete headers['x-pe-source-links'];
+      return route.continue({url: url.toString(), headers});
+    });
     const page = await context.newPage();
     const suffix = transport === "agui" ? "/?agentTransport=copilotkit" : "/";
     await page.goto(origin + suffix);

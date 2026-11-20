@@ -1,9 +1,10 @@
 import {digest} from './source-plan.mjs';
+import {DOCUMENT_OUTPUT_POLICY} from '../../lib/document-output-policy.mjs';
 import {appendTurnMarker} from './turn-delivery.mjs';
 
 const instructions = {
   request:
-    '只读原问。列出明确要求，保留原文区间所对应的精确词语、条件、轮次、材料和必答字段。输出 JSON {"kind":"ordinary|history|mixed|pending","items":[{"action":"search|read","term":"原问中明确要求查的词（未指定则为空）","quote":"原文","condition":"原文或空","fields":[]}]}。书名和输出字段本身不是待搜索的词。',
+    '只读原问。列出明确要求，保留原文区间所对应的精确词语、条件、轮次、材料和必答字段。输出 JSON {"kind":"ordinary|history|mixed|pending","items":[{"action":"search|read","term":"原问中明确要求查的词（未指定则为空）","quote":"原文","condition":"原文或空","fields":[]}]}。书名和输出字段本身不是待搜索的词。返回历史引用的字段属于 search；只有另行读取材料才列 read。',
   claims:
     '只读可见 Markdown。对每个给出的 unit 逐项回答，quote 必须完整逐字复制对应的 unit，不复制用户原问。不接触工具真值。按每个完整句或独立行列出所作的实质断言，逐字复制 quote，保留否定、条件、并列附加事实的作用域。输出 JSON {"claims":[{"quote":"精确原文","relation":"historical|current|absence|financial|scope|unknown","polarity":"positive|negative|uncertain","fields":[{"name":"materialId|version|locator|filename|id|value","literal":"原文字段"}]}]}。仅陈述本次答文会报告哪些字段、不会重报哪些内容，且没有附加事实时标 scope。单独的字段标题属于同一出处。只有整句纯粹说明先前正式答文所用出处时才标 historical。引导语或字段排版不影响归类。',
 };
@@ -46,15 +47,43 @@ export function sourceModelOptions(active, model, options, configPayload) {
       const boundary = body.messages.findLastIndex(
         (m) => m.role === 'user' && JSON.stringify(m.content).includes(active.question),
       );
-      const currentContext = body.messages.findLastIndex(
-        (m) => m.role === 'user' && JSON.stringify(m.content).includes('<turn_context>'),
+      const parts = (m) =>
+        typeof m.content === 'string'
+          ? [m.content]
+          : Array.isArray(m.content)
+            ? m.content.map((p) => p.text ?? '')
+            : [];
+      const currentContext = active.contextContent
+        ? body.messages.findLastIndex(
+            (m) => m.role === 'user' && parts(m).some((p) => p === active.contextContent),
+          )
+        : -1;
+      const repeatedPolicy = body.messages.some(
+        (m) =>
+          ['system', 'developer'].includes(m.role) &&
+          parts(m).some((p) => p.includes(DOCUMENT_OUTPUT_POLICY)),
       );
+      const compactContext = (value) =>
+        value === active.contextContent ? value.replace(DOCUMENT_OUTPUT_POLICY + '\n', '') : value;
       body.messages = body.messages.flatMap((m, index) => {
         // Earlier tool arguments and per-turn context may concern a different
         // workbook. Only the current question's injected rules apply. All
         // system/developer instructions and current-turn attempts stay intact.
         if (index < boundary && index !== currentContext && ['user', 'assistant', 'tool'].includes(m.role))
           return [];
+        if (index === currentContext && repeatedPolicy) {
+          return [
+            {
+              ...m,
+              content:
+                typeof m.content === 'string'
+                  ? compactContext(m.content)
+                  : m.content.map((p) =>
+                      typeof p.text === 'string' ? {...p, text: compactContext(p.text)} : p,
+                    ),
+            },
+          ];
+        }
         if (m.role !== 'tool' || typeof m.content !== 'string') return [m];
         let result;
         try {

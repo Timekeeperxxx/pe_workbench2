@@ -120,6 +120,7 @@ export function evaluateSourceDraft({
   const claims = [],
     occurrences = [],
     rejected = [],
+    rejectedChecks = [],
     citations = new Map();
   let body = '',
     priorEnd = 0,
@@ -382,7 +383,7 @@ export function evaluateSourceDraft({
       question,
       direct.map((w) => w.citation),
       (isRead ? allHist : eligible)
-        .filter((w) => w.relation === 'historical')
+        .filter((w) => w.relation === 'historical' && (isRead || pool.some((c) => c.id === w.citation.id)))
         .map((w) => ({turn: w.turn, citations: [w.citation]})),
       direct.map((w) => w.citation),
     );
@@ -426,16 +427,13 @@ export function evaluateSourceDraft({
       )
     )
       valid = false;
+    const writtenValue = visible
+      .match(/(?:读数|数值|原始值|值)\s*(?:为|是|[:：])?\s*([-+\d,.]+)/)?.[1]
+      ?.replaceAll(',', '');
     if (
       isRead &&
       financial &&
-      !eligible.some(
-        (w) =>
-          w.citation.value != null &&
-          visible
-            .match(/(?:读数|数值|原始值|值)\s*(?:为|是|[:：])?\s*([-+\d,.]+)/)?.[1]
-            ?.replaceAll(',', '') === String(w.citation.value),
-      )
+      !eligible.some((w) => w.citation.value != null && writtenValue === String(w.citation.value))
     )
       valid = false;
     if (
@@ -448,6 +446,19 @@ export function evaluateSourceDraft({
     const findings = lint?.(s, pool) ?? [];
     if (findings.some((f) => blockingFinding(f) && f.rule !== 'incomplete')) valid = false;
     if (!valid) {
+      rejectedChecks.push({
+        start: unit.start,
+        end: unit.end,
+        claims: semantics.map((c) => c.relation),
+        relation: isRead ? 'current' : 'historical',
+        eligible: eligible.map((w) => [w.callId, w.citation.id]),
+        condition: currentDecision?.condition,
+        proof: Boolean(proof),
+        exact,
+        contradicted,
+        described: Boolean(described),
+        findings: findings.filter(blockingFinding).map(({rule, code, message}) => ({rule, code, message})),
+      });
       rejected.push(s);
       antecedent = undefined;
       continue;
@@ -455,9 +466,12 @@ export function evaluateSourceDraft({
     const touched = new Set([...refs.map((r) => r.citation.id), ...literals]);
     if (!touched.size) touched.add(fieldOwner.id);
     const matches = eligible.filter((w) => touched.has(w.citation.id));
+    const answering = selected.filter((i) => i.hits.some((w) => touched.has(w.citation.id)));
     const owners = isRead
       ? [currentDecision ?? optionalRead]
-      : selected.filter((i) => sourcesFor(i).some((w) => touched.has(w.citation.id)));
+      : answering.length
+        ? answering
+        : selected.filter((i) => sourcesFor(i).some((w) => touched.has(w.citation.id)));
     if (!owners.length) {
       rejected.push(s);
       continue;
@@ -469,8 +483,8 @@ export function evaluateSourceDraft({
       if (literalProof) i.delivered.add('id');
       if (isRead) {
         i.attemptIds = [...new Set([...i.attemptIds, ...matches.map((w) => w.callId)])];
-        const readValues = matches.map((w) => String(w.citation.value)).filter((v) => v !== 'undefined');
-        if (readValues.some((v) => visible.includes(v))) i.delivered.add('value');
+        if (writtenValue !== undefined && matches.some((w) => writtenValue === String(w.citation.value)))
+          i.delivered.add('value');
       }
       if (refs.length || literalProof) i.delivered.add('presence');
     }
@@ -567,5 +581,6 @@ export function evaluateSourceDraft({
     hostRepair,
     sourceDelivery: {schema: 1, planRev: plan.rev, textDigest: digest(body), items, claims, occurrences},
     rejected,
+    rejectedChecks,
   };
 }
