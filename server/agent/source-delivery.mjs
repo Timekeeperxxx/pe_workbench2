@@ -158,11 +158,19 @@ function executionReport(claim, text, owners, observations) {
     )
       continue;
     const ids = hits.flatMap((h) => (h.citations ?? []).map((c) => c.id));
-    const values = {assistantMatches: hits.length, totalTurns: coverage.totalTurns, truncated: false};
+    const values = {
+      assistantMatches: hits.length,
+      totalTurns: coverage.totalTurns,
+      turnsScanned: coverage.turnsScanned,
+      scannedTurn: coverage.turns?.length === 1 ? coverage.turns[0] : undefined,
+      ledgerMatches: d.ledgerTotalMatches,
+      truncated: false,
+    };
     if (observations.historyToolsOnly) values.directReadCount = 0;
     if (hits.length === 1) {
       const h = hits[0];
       values.sourceStatus = h.sourceStatus;
+      values.sourceTurnId = h.sourceTurnId;
       if (h.sourceTurnId && Array.isArray(h.sourceLimits)) values.limitCount = h.sourceLimits.length;
       if (
         h.sourceTurnId &&
@@ -178,33 +186,112 @@ function executionReport(claim, text, owners, observations) {
         !f.literal.trim() ||
         !text.includes(f.literal) ||
         !Object.hasOwn(values, f.name) ||
-        values[f.name] === undefined ||
-        values[f.name] !== f.value
+        values[f.name] === undefined
       )
         return false;
-      if (typeof f.value === 'number') {
+      const expected = values[f.name];
+      const statusNames = {
+        completed: '已完成',
+        partial: '部分完成',
+        failed: '失败',
+        cancelled: '已取消',
+        unknown: '未知',
+      };
+      const literal = f.literal;
+      // The JSON reader can serialize a scalar as text. Compare it using
+      // the type of the durable observation and verify its visible spelling.
+      const value = String(f.value);
+      if (value !== String(expected) && !(f.name === 'sourceStatus' && value === statusNames[expected]))
+        return false;
+      if (typeof expected === 'number') {
         const digits = f.literal.match(/\d+/g) ?? [];
-        if (digits.length) return digits.every((n) => Number(n) === f.value);
-        if (f.value === 0) return /未|没有|无|零|未曾/.test(f.literal);
+        if (digits.length) return digits.every((n) => Number(n) === expected);
+        if (expected === 0) return /未|没有|无|零|未曾/.test(f.literal);
         return (
-          Number.isInteger(f.value) &&
-          f.value > 0 &&
-          f.value < 10 &&
-          f.literal.includes('零一二三四五六七八九'[f.value])
+          Number.isInteger(expected) &&
+          expected > 0 &&
+          expected < 10 &&
+          f.literal.includes('零一二三四五六七八九'[expected])
         );
       }
-      if (typeof f.value === 'boolean')
+      if (typeof expected === 'boolean')
         return (
-          f.literal.includes(String(f.value)) || (f.value === false && /未截断|没有截断/.test(f.literal))
+          f.literal.includes(String(expected)) || (expected === false && /未截断|没有截断/.test(f.literal))
         );
-      return typeof f.value === 'string' && f.literal.includes(f.value);
+      return (
+        typeof expected === 'string' &&
+        (literal.includes(expected) || (f.name === 'sourceStatus' && literal.includes(statusNames[expected])))
+      );
     };
-    if (claim.fields.every(corroborated)) return attempt;
+    if (!claim.fields.every(corroborated)) continue;
+    let unchecked = text;
+    for (const field of [...claim.fields].sort((a, b) => b.literal.length - a.literal.length)) {
+      unchecked = unchecked.replace(field.literal, ' ');
+    }
+    unchecked = unchecked.replace(/第\s*(\d+)\s*轮/g, (token, n) =>
+      coverage.turns?.length === 1 && coverage.turns[0] === Number(n) ? ' ' : token,
+    );
+    if (!/[\da-f]{8}-[\da-f-]{27}|\d|\.xlsx|cite:/i.test(unchecked)) return attempt;
   }
 }
 
 function distinctWitnesses(witnesses) {
   return [...new Map(witnesses.map((w) => [w.citation.id, w])).values()];
+}
+
+// A budget stop can precede the first printable draft even though the
+// requested source was retrieved. Recover only a fully enumerated, unique
+// source and submit the resulting text to the ordinary field verifier.
+export function recoverSourceFields(plan, observations) {
+  if (
+    plan.route !== 'history' ||
+    plan.research ||
+    plan.gaps.length ||
+    plan.items.length !== 1 ||
+    observations.recoveryGaps.length ||
+    observations.badIds.length
+  )
+    return;
+  const [item] = observations.items;
+  if (!item || item.item.action !== 'search' || item.item.operation !== 'source' || !item.item.turn) return;
+  const sources = distinctWitnesses(item.hits);
+  if (sources.length !== 1) return;
+  const w = sources[0],
+    c = w.citation;
+  const attempt = observations.attempts.find((a) => a.id === w.callId);
+  const d = attempt?.details;
+  if (
+    !w.sourceTurnId ||
+    !d?.coverage ||
+    d.coverage.truncated !== false ||
+    !d.coverage.turns?.includes(item.item.turn) ||
+    d.matches?.length !== d.totalMatches ||
+    d.matches.filter((m) => m.role === 'assistant').length !== 1
+  )
+    return;
+  // Use plain representable identifiers. The workbook and cell stay on the
+  // original version even when the catalogue now has a newer head.
+  if (
+    !/^[\p{L}\p{N}_. -]+\.xls[xm]$/u.test(c.filename ?? '') ||
+    !/^[\p{L}\p{N}_ -]+!\$?[A-Z]{1,3}\$?\d+$/u.test(c.locator ?? '') ||
+    !/^[\da-f-]{36}$/i.test(c.materialId ?? '') ||
+    c.id !== 'cite:' + c.materialId + ':v' + c.version + ':' + c.locator
+  )
+    return;
+  return (
+    '第' +
+    w.turn +
+    '轮正式回答引用的是 [' +
+    c.filename +
+    ']' +
+    c.locator +
+    '（材料 ID ' +
+    c.materialId +
+    '，版本 v' +
+    c.version +
+    '）。\n\n完整引用 ID：' +
+    c.id
+  );
 }
 
 export function evaluateSourceDraft({
@@ -266,6 +353,7 @@ export function evaluateSourceDraft({
   const claims = [],
     occurrences = [],
     rejected = [],
+    optionalNotes = [],
     rejectedChecks = [],
     citations = new Map();
   let body = '',
@@ -330,9 +418,26 @@ export function evaluateSourceDraft({
         return s.includes(c.quote) || (quote && visibleUnit.includes(quote));
       }) ?? [];
     const whole = semantics.find((c) => c.quote === s || visibleMarkdown(c.quote).trim() === visibleUnit);
-    if (whole?.relation === 'execution') {
-      const attempt = executionReport(whole, s, selected, observations);
+    const executionClaims = semantics.filter((c) => c.relation === 'execution');
+    const completeExecution =
+      executionClaims.length &&
+      executionClaims.length === semantics.length &&
+      (whole ||
+        !executionClaims
+          .reduce((rest, c) => rest.replace(c.quote, ''), s)
+          .replace(/[\s。，、；;,.：:]/g, ''));
+    if (completeExecution) {
+      const evidence = {relation: 'execution', fields: executionClaims.flatMap((c) => c.fields ?? [])};
+      const attempt = executionReport(evidence, s, selected, observations);
       if (attempt) accept(unit, [], selected, [{callId: attempt.id}], 'execution');
+      else if (
+        plan.route === 'history' &&
+        decisions.every((i) => i.operation === 'source') &&
+        !/覆盖|扫描|台账|是否截断|工具过程|检索过程/.test(question) &&
+        !extractLocatorMatches(s).length &&
+        !/\.xls[xm]|cite:|@v\d|\bv\d/i.test(s)
+      )
+        optionalNotes.push(s);
       else rejected.push(s);
       continue;
     }
@@ -643,7 +748,7 @@ export function evaluateSourceDraft({
     antecedent = fieldOwner;
     accept(unit, refs, owners, matches, isRead ? 'current' : 'historical');
   }
-  const hostRepair = false;
+  const hostRepair = optionalNotes.length > 0;
   for (const i of decisions) {
     if (i.state === 'confirmedEmpty') continue;
     const unique = distinctWitnesses(i.hits);
@@ -735,5 +840,6 @@ export function evaluateSourceDraft({
     sourceDelivery: {schema: 1, planRev: plan.rev, textDigest: digest(body), items, claims, occurrences},
     rejected,
     rejectedChecks,
+    optionalNotes,
   };
 }

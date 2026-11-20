@@ -6,7 +6,7 @@ import { recordUserClaims } from '../../lib/claim-detect.mjs';
 import { randomUUID } from 'node:crypto';
 import { prepareSourcePlan, modelPlan, assertionQuestion, digest } from './source-plan.mjs';
 import { sourceObservations } from './source-observations.mjs';
-import { evaluateSourceDraft } from './source-delivery.mjs';
+import { evaluateSourceDraft, recoverSourceFields } from './source-delivery.mjs';
 import { lintAnswer, lintLedgerAnswer, answerStats, asksDeviationQuestion, contextModelTarget } from '../../lib/answer-lint.mjs';
 import { collectCitationsFromToolCalls, currentCitation, rehydrateCitations, toolEvidenceState } from '../../lib/citations.mjs';
 import { extractLocatorMatches } from '../../lib/citation-locator.mjs';
@@ -95,6 +95,21 @@ function failureReason(error) {
   return isContextBudgetError(reason) ? CONTEXT_BUDGET_FAILURE : reason;
 }
 
+function scannedTurnTools(session,turnBoundary) {
+  const scanned=[];
+  const messages=session.messages.slice(turnBoundary);
+  for (const [index,message] of messages.entries()) for (const call of Array.isArray(message.content)?message.content:[]) {
+    if (call.type!=='toolCall') continue;
+    const copies=messages.filter(m=>m.role==='toolResult' && m.toolCallId===call.id);
+    for (const result of copies.length ? copies : [null]) scanned.push({
+      messageIndex:turnBoundary+index,id:call.id,name:call.name,args:call.arguments,argumentsError:call.argumentsError,
+      success:Boolean(result) && result.isError===false && toolEvidenceState(result)!=='failed',
+      details:result?.details,result,
+    });
+  }
+  return scanned;
+}
+
 async function generateAnswer(entry, promptText, options, active) {
   const { turnId, question: text } = active;
   entry.ctx?.factMemory?.recover();
@@ -102,11 +117,26 @@ async function generateAnswer(entry, promptText, options, active) {
   let continuationCount = 0;
   let safeText = '';
   let safeCitations = [];
-  const interrupted = reason => ({
-    ...(active.safeDecision || {}),
-    status: active.cancelled ? 'cancelled' : safeText ? 'partial' : 'failed',
-    text: safeText, citations: safeCitations, reason: failureReason(reason),
-  });
+  const interrupted = reason => {
+    if (!active.cancelled && active.sourceBudgetStop && !safeText && active.admitted) {
+      const observations=sourceObservations(active.plan,scannedTurnTools(entry.session,turnBoundary),toolCalls,entry.ctx?.store);
+      const recovered=recoverSourceFields(active.plan,observations);
+      if (recovered) {
+        const {hostRepair,rejected,rejectedChecks,optionalNotes,...decision}=evaluateSourceDraft({
+          text:recovered,question:text,plan:active.plan,observations,currentVersions:{},
+          lint:(part,pool)=>lintAnswer(part,{question:text,citations:pool,locatorCitations:pool}),repairId:false,
+        });
+        if (decision.status==='completed' && !rejected.length) {
+          appendTurnMarker(entry.session,'pe_source_host_repair',{turnId,reason:failureReason(reason),
+            kind:'verifiedFieldsAfterBudgetStop',before:digest(safeText),after:decision.sourceDelivery.textDigest,
+            callIds:decision.sourceDelivery.claims.flatMap(c=>c.callIds)});
+          return decision;
+        }
+      }
+    }
+    return {...(active.safeDecision||{}),status:active.cancelled?'cancelled':safeText?'partial':'failed',
+      text:safeText,citations:safeCitations,reason:failureReason(reason)};
+  };
   let latestMessage;
   let continuationPrefix = null;
   const toolCalls = entry.turnToolCalls = [];
@@ -173,13 +203,7 @@ async function generateAnswer(entry, promptText, options, active) {
       const noProgress = continuationPrefix !== null && joined.trimEnd() === prefix.trimEnd();
       const answer = presentUserAnswer(joined);
       // Also support restored/minimal sessions that expose tool messages but no events.
-      const scanned = [];
-      const messages = entry.session.messages.slice(turnBoundary);
-      for (const [index, m] of messages.entries()) for (const c of Array.isArray(m.content) ? m.content : []) {
-        if (c.type !== 'toolCall') continue;
-        const copies = messages.filter(r => r.role === 'toolResult' && r.toolCallId === c.id);
-        for (const result of copies.length ? copies : [null]) scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, argumentsError: c.argumentsError, success: Boolean(result) && result.isError === false && toolEvidenceState(result) !== 'failed', details:result?.details, result });
-      }
+      const scanned = scannedTurnTools(entry.session,turnBoundary);
       for(const call of scanned) if(call.success) registrationJobs.push(registerToolResult(entry.ctx?.root,entry.id,call,{turn}).catch(()=>[]));
       const registered= (await Promise.all(registrationJobs)).flat().filter(Boolean);
       // Deduplicate restored and live copies by execution ID. The live terminal
@@ -256,10 +280,10 @@ async function generateAnswer(entry, promptText, options, active) {
         };
         const evaluated=evaluateSourceDraft({text:answer,question:text,plan:active.plan,observations,currentVersions:sourceVersions,
           meaning,review:active.reviewed,lint:scopedLint});
-        const {hostRepair,rejected,rejectedChecks,...decision}=evaluated;
+        const {hostRepair,rejected,rejectedChecks,optionalNotes,...decision}=evaluated;
         const incomplete = message.stopReason==='length' || (observations.items.some(i=>i.hits.length || i.related.length) && lintAnswer(answer,lintContext).some(f=>f.rule==='incomplete' &&
           !(f.message==='句末可能截断' && (decision.sourceDelivery.items.some(i=>i.fieldsDelivered.includes('id')) || /未核验[：:]无$/.test(answer)))));
-        const trace={turnId,rejectedChecks,attempt:correctionCount+continuationCount,raw:active.rawDrafts.slice(),meaning:meaning?.claims,requests:active.budget?.requests,languageErrors:active.languageErrors,reviewed:digest(delta),
+        const trace={turnId,rejectedChecks,optionalNotes,attempt:correctionCount+continuationCount,raw:active.rawDrafts.slice(),meaning:meaning?.claims,requests:active.budget?.requests,languageErrors:active.languageErrors,reviewed:digest(delta),
           assembled:digest(joined),presented:digest(answer),final:decision.sourceDelivery.textDigest,
           correctionCount,continuationCount,hostRepair,stopReason:message.stopReason};
         appendTurnMarker(entry.session,'pe_source_observation',{turnId,attempts:observations.attempts.map(({details,...c})=>c),

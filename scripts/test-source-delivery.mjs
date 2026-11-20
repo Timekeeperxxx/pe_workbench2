@@ -34,7 +34,7 @@ const multiple =
 const exists =
   '请查第1轮“折旧政策”是否引用过 Acceptance13.xlsx；仅当引用过才查同一材料当前版本，否则只报告未命中。';
 
-async function run(question, searches, text) {
+async function run(question, searches, text, budgetStop = false) {
   const rows = [];
   const events = new Set();
   const prior = [
@@ -70,10 +70,20 @@ async function run(question, searches, text) {
           );
         }
       }
-      this.messages.push({role: 'assistant', content: text, stopReason: 'stop', timestamp: Date.now()});
+      if (budgetStop) {
+        entry.activeTurn.sourceBudgetStop = {lane: 'business'};
+        this.messages.push({
+          role: 'assistant',
+          content: [],
+          stopReason: 'error',
+          errorMessage: '来源核验模型预算耗尽',
+        });
+      } else
+        this.messages.push({role: 'assistant', content: text, stopReason: 'stop', timestamp: Date.now()});
     },
   };
-  const record = await runWithPostAnswer({session, id: 'session'}, question);
+  const entry = {session, id: 'session'};
+  const record = await runWithPostAnswer(entry, question);
   return {record, rows, markersAtCall, session};
 }
 
@@ -101,6 +111,17 @@ test('single query recovered, independently visible ID retained, source turn pre
     next.details.matches.some((m) => m.sourceTurnId === record.turnId && m.sourceStatus === 'completed'),
   );
 });
+test('budget recovery publishes one verified unique source and separately records host authorship', async () => {
+  const result = await run(history, [{query, turn: 1}], '', true);
+  assert.equal(result.record.status, 'completed', result.record.reason);
+  assert.equal(result.record.citations[0].id, original.id);
+  assert.ok(result.record.text.includes(original.id));
+  assert.ok(result.rows.some((r) => r.type === 'pe_source_host_repair'));
+  const missing = await run(history, [], '', true);
+  assert.equal(missing.record.status, 'failed');
+  assert.ok(!missing.rows.some((r) => r.type === 'pe_source_host_repair'));
+});
+
 test('a verified result for X does not satisfy the missing query Y', async () => {
   const {record} = await run(multiple, [{query, turn: 1}], report);
   assert.deepEqual([record.status, record.text], ['partial', report]);
