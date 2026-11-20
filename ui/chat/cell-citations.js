@@ -226,4 +226,35 @@ export function linkCitations(textHtml, citations) {
 }
 
 export { citationLookup };
+// Mark trusted offsets in Markdown before rendering. Replace markers only
+// in text nodes of the sanitized result; never interpolate marks into attributes.
+export function renderBoundCitations(text, delivery, citations, render) {
+  const refs=new Map(citations.map(c=>[c.id,c]));
+  if (delivery?.schema!==1 || !Array.isArray(delivery.occurrences)) return render(text);
+  const prefix='PESOURCE'+String(delivery.textDigest).slice(0,20)+'X';
+  if (text.includes(prefix)) return render(text);
+  let markdown='',end=0;
+  const slots=[];
+  for (const row of delivery.occurrences) {
+    const c=refs.get(row.citationId);
+    if (!c?.version || row.start<end || row.end<=row.start || text.slice(row.start,row.end)!==row.text) return render(text);
+    const marker=prefix+slots.length+'Z';
+    slots.push({marker,html:citationButton(c,row.text),text:row.text});
+    markdown+=text.slice(end,row.start)+marker;
+    end=row.end;
+  }
+  const html=render(markdown+text.slice(end));
+  const tokens=html.split(/(<[^>]*>)/g);
+  let inside=0;
+  return tokens.map((token,i)=>{
+    if (i%2) {
+      if (/^<(a|button)\b/i.test(token)) inside++;
+      if (/^<\/(a|button)\b/i.test(token)) inside=Math.max(0,inside-1);
+      return token.replace(/PESOURCE[\da-f]+X\d+Z/g,'');
+    }
+    for (const slot of slots) token=token.replaceAll(slot.marker,inside?escapeHTML(slot.text):slot.html);
+    return token;
+  }).join('');
+}
+
 export default linkCitations;

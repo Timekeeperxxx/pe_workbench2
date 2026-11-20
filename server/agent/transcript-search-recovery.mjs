@@ -15,7 +15,7 @@ function queryKey(query) {
 // transcript_search accepts separate keywords. A workbook and a cell can
 // spell one requested [workbook]Sheet!A1 only if the actual formal hit
 // contains that whole literal and resolves it to its returned citation.
-function matchesQuery(requested, call, turn) {
+export function matchesQuery(requested, call, turn) {
   const actual = queryKey(call.args?.query);
   if (requested === actual) return true;
   const token = /^\[([^\]]+)\](.+)$/.exec(requested);
@@ -27,7 +27,7 @@ function matchesQuery(requested, call, turn) {
 
 // Bind literal operands to the search that introduces them. Quoted output
 // fields later in a request (e.g. 报告“完整 ID”) are not additional queries.
-function requestedSearches(question) {
+export function requestedSearches(question) {
   const targets = [];
   const rounds = explicitTurns(question);
   // A comma may separate literal operands, clauses or even be inside
@@ -82,7 +82,7 @@ function coversTurn(args, turn) {
 
 // Pi keeps malformed JSON in the diagnostic, with empty final arguments.
 // Read its partial selectors only to rule out a different target.
-function retryOf(call, success, targets, rounds) {
+export function retryOf(call, success, targets, rounds) {
   const raw = call.argumentsError?.split('\n\nReceived arguments:\n')[1];
   const failed = { ...(raw && parseStreamingJson(raw)), ...call.args };
   const args = success.args ?? {};
@@ -113,7 +113,7 @@ function retryOf(call, success, targets, rounds) {
 
 // Read whole filenames from the explicitly restricted list. Never select a
 // source by matching the suffix of an unknown filename.
-function requestedWorkbooks(question) {
+export function requestedWorkbooks(question) {
   const names = new Set();
   const restriction = /(?:只|仅)(?:需|要)?(?:看|查阅|查看|关注|考虑|分析|限于|限|报告|列出|说明|给出)[^。；;!?！？]*?(?:工作簿|文件)\s*/g;
   for (const field of question.matchAll(restriction)) {
@@ -151,7 +151,7 @@ const MISS = /(?:未(?:能)?(?:命中|检索到|查询到|找到|查到|匹配)|
 
 // Bind each explicit result to its own operands. Sentence punctuation does
 // not decide whether A's successful search can vouch for B's result.
-function resultReports(parts, targets, isSource) {
+export function resultReports(parts, targets, isSource) {
   const reports = [];
   for (const part of parts) {
     const notes = [];

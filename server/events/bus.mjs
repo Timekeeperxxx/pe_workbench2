@@ -12,6 +12,8 @@ export function sendToClient(res, payload) {
   return sendSse(res, payload);
 }
 
+import {exactSourceReader,projectSourceEvent} from '../../lib/source-reader.mjs';
+
 export function createEventBus() {
   const globalClients = new Map();
   const listeners = new Set();
@@ -41,10 +43,11 @@ export function createEventBus() {
     return delivered;
   }
 
+  const exactReaders=new WeakSet();
   function broadcast(entry, payload) {
     let delivered = 0;
     for (const res of entry.clients) {
-      if (sendToClient(res, payload)) delivered += 1;
+      if (sendToClient(res, projectSourceEvent(payload,exactReaders.has(res)))) delivered += 1;
     }
     return delivered;
   }
@@ -70,7 +73,8 @@ export function createEventBus() {
   function openSession(req, res, entry) {
     initSse(res);
     entry.clients.add(res);
-    sendToClient(res, entry.snapshot());
+    if (exactSourceReader(req)) exactReaders.add(res);
+    sendToClient(res, projectSourceEvent(entry.snapshot(),exactReaders.has(res)));
     const ping = setInterval(() => {
       try {
         res.write(": ping\n\n");

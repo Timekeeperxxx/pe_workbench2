@@ -118,7 +118,7 @@ export class CopilotPilotClient {
       runtimeUrl: "/api/copilotkit",
       runtimeTransport: "rest",
       deferInitialConnection: true,
-      headers: { "X-Project-Id": projectId },
+      headers: { "X-Project-Id": projectId, "X-PE-Source-Links":"exact-v1" },
       credentials: "same-origin",
       properties: { projectId },
       debug: false,

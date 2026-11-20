@@ -129,6 +129,7 @@ function conversationTurns(session, {beforeTurnId, legacyBoundary} = {}) {
           turns.push(current);
         }
         current.messages.push(message);
+        if (message.role==='assistant' && item.entryId) current.assistantEntryId=item.entryId;
       }
     }
   }
@@ -235,6 +236,7 @@ function answerMessage(turn, { allowProcessFallback = true } = {}) {
     turnId: start.turnId,
     text: delivery?.text ?? "",
     citations: delivery?.citations ?? [],
+    ...(delivery?.sourceDelivery ? {sourceDelivery:delivery.sourceDelivery} : {}),
     status: delivery?.status ?? "pending",
     ...(delivery?.reason ? { reason: delivery.reason } : {}),
     ...(delivery ? { finishedAt: delivery.finishedAt } : {}),
@@ -274,6 +276,9 @@ export function transcriptMessages(session, ctx, options = {}) {
     }
     out.push({
       role: "assistant", content: answer.text,
+      sourceTurnId:turn.start?.turnId ?? null, ...(turn.assistantEntryId && !turn.start ? {legacyAnchor:turn.assistantEntryId} : {}), sourceStatus:answer.status ?? "unknown",
+      ...(answer.reason ? {sourceLimits:[answer.reason]} : {}),
+      ...(answer.sourceDelivery ? {sourceClaims:answer.sourceDelivery.claims,sourceDigest:answer.sourceDelivery.textDigest,sourceOccurrences:answer.sourceDelivery.occurrences} : {}),
       timestamp: turn.delivery?.finishedAt ?? turn.messages.findLast(m => m.role === "assistant")?.timestamp,
       ...(answer.citations?.length ? { citations: answer.citations } : {}),
     });

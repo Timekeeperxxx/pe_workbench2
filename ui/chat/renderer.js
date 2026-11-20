@@ -11,7 +11,7 @@ import { approvalsShelfHTML } from "../approvals/approvals.js";
 import { renderToolPresentation } from "../tool-renderers/registry.js";
 import { sanitizeMarkdown } from "../previews/previews.js";
 import { renderFrameworkPresentation } from "./presentation.js";
-import { linkCitations } from "./cell-citations.js";
+import { renderBoundCitations, linkCitations } from "./cell-citations.js";
 import { presentUserAnswer } from "./user-facing-answer.js";
 import { runtime } from "../runtime.js";
 import { getThreadScroll } from "./thread-scroll.js";
@@ -298,7 +298,9 @@ function messageHTML(m, { openGroups } = {}) {
     : renderMarkdownHTML(delivered || cancelled ? m.text || '' : presentUserAnswer(m.text || ''), '', highlightBudget);
   const citations = m.citations ?? (m.tools || []).flatMap(tool => Array.isArray(tool.citations) ? tool.citations : []);
   // The vm-based renderer test intentionally omits the module binding.
-  if (typeof linkCitations === 'function' && citations.length && (delivered || !m.failure)) body = linkCitations(body, citations);
+  if (m.sourceDelivery && typeof renderBoundCitations==='function')
+    body=renderBoundCitations(m.text || '',m.sourceDelivery,citations,value=>renderMarkdownHTML(value,'',highlightBudget));
+  else if (typeof linkCitations === 'function' && citations.length && (delivered || !m.failure)) body = linkCitations(body, citations);
   if (!isUser && m.status && m.status !== 'completed') {
     const label = { partial: '部分完成', failed: '回答失败', cancelled: '已取消', pending: '正在处理' }[m.status];
     if (label) body += `<p class="msg-failure" role="status">${label}${m.reason ? ' · ' + esc(m.reason) : ''}</p>`;

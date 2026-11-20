@@ -438,7 +438,7 @@ console.log('target deviation post-answer correction passed');
         for (const [i, call] of calls.entries()) {
           const toolCallId = 'tool-' + attempts + '-' + i;
           const toolName = call.name ?? (call.search ? 'transcript_search' : 'workbook_query');
-          const args = call.args ?? {};
+          const args = call.args ?? (call.search ? {query:'来源',turn:call.search.matches?.[0]?.turn??1} : {});
           append({ role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: toolCallId, name: toolName, arguments: args, argumentsError: call.argumentsError }] });
           emit({ type: 'tool_execution_start', toolCallId, toolName, args });
           const result = {
@@ -473,7 +473,7 @@ console.log('target deviation post-answer correction passed');
     };
     const entry = { id: manager.getSessionId(), ctx: { root: suiteRoot }, session };
     const record = await runWithPostAnswer(entry, question);
-    assert.equal(attempts, steps.length, 'bounded attempts');
+    assert.equal(attempts, steps.length, `bounded attempts: ${question} / ${steps.flatMap(s=>s.tools??[]).map(t=>JSON.stringify(t.args)).join(', ')} / ${steps[0]?.text}: ${record.reason??record.status}`);
     const metadata = type => manager.getBranch().filter(item => item.type === 'custom' && item.customType === type).map(item => item.data);
     assert.deepEqual(metadata('pe_turn_delivery'), [record]);
     assert.deepEqual(metadata('pe_turn_started').map(item => item.turnId), [record.turnId]);
@@ -524,7 +524,7 @@ console.log('target deviation post-answer correction passed');
 
     const sourceQuestion = '第一轮正式回答当时引用了哪个单元格？';
     const liveSource = { ...newCite, filename: 'Acceptance13.xlsx', materialId: '02cdf096-6b1f-40ea-8d69-6ee87fec0537' };
-    const liveSearch = { matches: [{ ...hit, citations: [liveSource] }], totalMatches: 1 };
+    const liveSearch = { matches: [{ ...hit, citations: [liveSource] }], totalMatches: 1, ledgerTotalMatches:0 };
     const liveAnswer = '命中 1 条，在第 1 轮由助手给出的回答中：该回答引用的单元格是 [Acceptance13.xlsx]Model!B2，材料 ID 为 '
       + liveSource.materialId + '@v1。台账中与“字面常量”这条查询相关的记录为 0 条。';
     for (const text of [liveAnswer, '引用的是 [Acceptance13.xlsx]Model!B2。',
@@ -674,11 +674,11 @@ console.log('target deviation post-answer correction passed');
     const falseZero = await runScript([{ tools: [failed, success], text: withZero }], twoTerms);
     assert.equal(falseZero.record.status, 'partial');
     assert.equal(falseZero.record.text, separate);
-    for (const [name, expected] of [[stored.filename, 'completed'], ['Budget13.xlsx', 'partial']]) {
+    for (const [name, expected] of [[stored.filename, 'completed'], ['Budget13.xlsx', 'failed']]) {
       for (const label of ['这次只看工作簿', '只报告工作簿']) {
         const question = `请在第1轮查询“字面常量”。${label} ${name} 的历史出处，请给出单元格、材料版本和完整引用 ID。`;
         const { record } = await runScript([{ tools: [failed, success], text: separate }], question);
-        assert.deepEqual([record.status, record.text], [expected, separate], question);
+        assert.deepEqual([record.status, record.text], [expected, expected==='failed'?'':separate], question);
         if (expected === 'partial') assert.ok(record.reason.includes(name), record.reason);
       }
     }
@@ -722,10 +722,10 @@ console.log('target deviation post-answer correction passed');
     }
     // An explicitly requested workbook restricts the fields due from a hit.
     const multiBookSearch = { ...success, search: { matches: [{ ...hit, citations: [stored, secondSource] }] } };
-    for (const [name, expected] of [[stored.filename, 'completed'], ['copy+' + stored.filename, 'partial']]) {
+    for (const [name, expected] of [[stored.filename, 'completed'], ['copy+' + stored.filename, 'failed']]) {
       const question = `请在第1轮查询“字面常量”，只报告第1轮正式回答中工作簿 ${name} 的单元格、版本和完整引用 ID。`;
       const { record } = await runScript([{ tools: [failed, multiBookSearch], text: separate }], question);
-      assert.deepEqual([record.status, record.text], [expected, separate]);
+      assert.deepEqual([record.status, record.text], [expected, expected==='failed'?'':separate]);
     }
     for (const names of [[stored.filename, 'Budget13.xlsx'], ['Budget13.xlsx', stored.filename]]) {
       const question = `请在第1轮查询“字面常量”。这次只看工作簿 ${names.join(' 和 ')} 的历史出处，请分别列出引用 ID。`;
@@ -924,7 +924,7 @@ console.log('target deviation post-answer correction passed');
         [{ search: idSearch, text }, ...(!accepted ? [{ text }] : [])];
       const { record } = await runScript(steps, versionQuestion);
       assert.deepEqual([record.status, record.text, record.citations],
-        [accepted ? 'completed' : 'partial', accepted ? text : historicalSource, [returned]], note);
+        [accepted && read.length ? 'completed' : 'partial', accepted ? text : historicalSource, [returned]], note);
     }
     for (const [currentVersion, accepted] of [['v2', true], ['v1', false]]) {
       const text = '截至今天，这份材料的版本为 ' + currentVersion + '。' + historicalSource;

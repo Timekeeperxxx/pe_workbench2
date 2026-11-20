@@ -5,6 +5,8 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 
+import {exactSourceReader,projectSourceEvent} from '../../lib/source-reader.mjs';
+
 export async function handleSessions({ req, res, url, app, ctx }) {
   const { json, readJson } = app.http;
   const { sessions, bus, broadcast, nowIso, ALLOWED_MODELS, config, makeTitle } = app;
@@ -31,7 +33,7 @@ export async function handleSessions({ req, res, url, app, ctx }) {
     if (!entry) return json(res, 404, { error: "session not found" });
 
     if (action === "state" && req.method === "GET") {
-      return json(res, 200, entry.snapshot());
+      return json(res, 200, projectSourceEvent(entry.snapshot(),exactSourceReader(req)));
     }
 
     if (action === "events" && req.method === "GET") {

@@ -7,6 +7,9 @@ import { createFactMemoryTools, withFactCapture } from '../../lib/fact-memory/to
  * handlers only parse HTTP input and call these methods.
  */
 
+import { conditionValue, sourceObservations } from './source-observations.mjs';
+import { digest } from './source-plan.mjs';
+import { sourceModelOptions, readSourceLanguage, recordSourceModelCall } from './source-provider.mjs';
 import {auditResearch} from "../../lib/research-audit.mjs";
 import { guardResearchDelivery } from "../../lib/research-delivery.mjs";
 import {createResearchReview} from "../../lib/research-review.mjs";
@@ -33,6 +36,7 @@ import {
   serializeSession,
   transcriptMessages,
   titleFromMessages,
+  frameworkStatePath,
 } from "./snapshot.mjs";
 import { assessContextBudget, contextBudgetFailureStream, fitContextMessages } from "../../lib/context-budget.mjs";
 import { systemHint } from "../project-context.mjs";
@@ -152,6 +156,7 @@ export function createSessionService({
     });
     let session;
     let entry;
+    let languageReader;
     const metadata=()=>({session_id:session?.sessionId || id || '',run_id:entry?.localRunId || '',turn:session?.messages?.filter(m=>m.role==='user'&&!m.peInternal&&!m.customType).length || 0,actor:automated||writeRoots?'automation':'agent'});
     const memoryTools=ctx.factMemory ? createFactMemoryTools({memory:ctx.factMemory,getMetadata:metadata}) : [];
     const sessionTools = automated || writeRoots ? memoryTools.filter(t=>t.name==='fact_query') : [
@@ -161,7 +166,7 @@ export function createSessionService({
         broadcast: event => bus.broadcastGlobal(event, ctx.id),
         onChange: () => { if (entry) bus.broadcast(entry, entry.snapshot()); },
       }),
-      createTranscriptSearchTool({getMessages: () => transcriptMessages(session, ctx, { beforeTurnId: entry?.activeTurn?.turnId, legacyBoundary: entry?.transcriptBoundary }), getLedger: () => readLedger(ctx.root, session.sessionId)}),
+      createTranscriptSearchTool({getActive:()=>entry?.activeTurn,getMessages: () => transcriptMessages(session, ctx, { beforeTurnId: entry?.activeTurn?.turnId, legacyBoundary: entry?.transcriptBoundary }), getLedger: () => readLedger(ctx.root, session.sessionId)}),
     ];
     if (config.fakeAgent) {
       session = await createFakeSession({ id: id || undefined, ctx, config });
@@ -185,11 +190,32 @@ export function createSessionService({
       });
       session = created.session;
       const stream = session.agent.streamFunction;
-      session.agent.streamFunction = (model, context, options) => {
-        const transcript = normalizeContext(context);
+      session.agent.streamFunction = async (model, context, options) => {
+        const active=entry?.activeTurn;
+        const sourceMode=active?.plan && active.plan.route!=='ordinary';
+        const research=active?.plan?.research || ['research-audit','research-report-audit','research-synthesis'].includes(options?.sourceStage);
+        // Offer the tools this source operation can use before Pi normalizes
+        // its system/tool updates; keep the full research request when needed.
+        const narrow=sourceMode && !research && !options?.sourceOperation;
+        let input=context;
+        if (narrow) {
+          const allowed=new Set(active.plan.items.some(i=>i.action==='read') ?
+            ['transcript_search','workbook_query','workbook_trace'] : ['transcript_search']);
+          const tools=context.tools?.filter(t=>allowed.has(t.name));
+          const messages=context.messages.map(m=>m.role==='system' && m.toolsAdded ?
+            {...m,toolsAdded:m.toolsAdded.filter(t=>allowed.has(t.name))}:m);
+          input={...context,tools,messages};
+        }
+        const transcript = normalizeContext(input);
         const messages = fitContextMessages(transcript.messages, model, undefined, options?.maxTokens);
         if (!assessContextBudget(messages, model, options?.maxTokens).ok) return contextBudgetFailureStream(model);
         const request = { messages };
+        if (active && (options?.sourceOperation || active.plan && active.plan.route!=='ordinary')) {
+          const bounded=sourceModelOptions(active,model,options,config.modelPayload);
+          const result=await stream(model,request,bounded);
+          recordSourceModelCall(session,active,result,context,options);
+          return result;
+        }
         if (!config.modelPayload) return stream(model, request, options);
         return stream(model, request, {
           ...options,
@@ -207,6 +233,13 @@ export function createSessionService({
       };
       session.agent.streamFunction = guardResearchDelivery(provider, {
         recordAudit,
+        onReviewed(review) {
+          const active=entry?.activeTurn;
+          if (!active || active.plan?.route==='ordinary') return;
+          const {text,...result}=review;
+          active.reviewed={...result,digest:digest(text)};
+          active.receipt?.('pe_source_research',active.reviewed);
+        },
         getSessionMessages: () => session.messages,
         getContinuation: () => entry?.activeTurn?.continueResearchAnswer,
         audit: (source, model, context, options, draft) =>
@@ -214,7 +247,7 @@ export function createSessionService({
         onContext: (model, context, options) => {
           researchReview.restoreEvidence(context.messages);
           researchReview.setAuditor(async (content, extra) => {
-            const verdict = await auditResearch(provider, model, context, options, content, {
+            const verdict = await auditResearch(provider, model, context, {...options,sourceStage:'research-report-audit'}, content, {
               ...extra, workbookEvidence: researchReview.evidenceSnapshot(),
             });
             recordAudit({ ...verdict, kind: "report", at: new Date().toISOString() });
@@ -222,12 +255,32 @@ export function createSessionService({
           });
         },
       });
+      const guardedStream=session.agent.streamFunction;
+      languageReader=(operation,input,active)=>{
+        // An embedding which replaces the business transport owns its model
+        // boundary too. Do not reach out to an unrelated configured provider.
+        if (session.agent.streamFunction!==guardedStream) return null;
+        const model=session.model??config.model;
+        if (!model || !config.allowedModels.has(model.id)) return null;
+        return readSourceLanguage(provider,model,operation,input,active);
+      };
     }
 
     session.agent.beforeToolCall = async ({ toolCall, args }) => {
+      const logical=frameworkStatePath(ctx,args?.path);
+      if (logical && ['edit','read'].includes(toolCall.name)) args={...args,path:logical};
       const outside = blockOutsideProject(ctx, toolCall.name, args);
       if (outside) return outside;
-      return blockOutsideWriteRoots(ctx, toolCall.name, args, writeRoots) ?? researchReview.before(toolCall.name, args) ?? undefined;
+      const veto=blockOutsideWriteRoots(ctx, toolCall.name, args, writeRoots) ?? researchReview.before(toolCall.name, args);
+      if (veto) return veto;
+      if (entry?.activeTurn?.sourceSchema && !entry.activeTurn.admitted) return {block:true,reason:'回合请求范围尚未持久化'};
+      const plan=entry?.activeTurn?.plan;
+      const read=plan?.items.find(i=>i.action==='read' && i.conditional);
+      if (read && ['workbook_query','workbook_trace'].includes(toolCall.name)) {
+        const observed=sourceObservations(plan,[],entry.turnToolCalls??[],ctx.store);
+        if (conditionValue(read.predicate,observed.items)!==true) return {block:true,reason:'请求的读取条件尚未被历史检索证实。'};
+      }
+      return undefined;
     };
 
     const afterToolCall = session.agent.afterToolCall;
@@ -236,7 +289,10 @@ export function createSessionService({
       // do not establish project evidence or an editable file baseline.
       const externalRead = context.toolCall.name === "read" && typeof context.args?.path === "string"
         && !path.resolve(ctx.root, context.args.path).startsWith(path.resolve(ctx.root) + path.sep);
-      const review = externalRead ? undefined : researchReview.record(context);
+      const logical=frameworkStatePath(ctx,context.args?.path);
+      const reviewContext=logical && ['edit','read'].includes(context.toolCall.name) ?
+        {...context,args:{...context.args,path:logical}} : context;
+      const review = externalRead ? undefined : researchReview.record(reviewContext);
       if (!review) return afterToolCall?.(context, signal);
       const result = { ...context.result, ...review };
       const normalized = await afterToolCall?.({ ...context, result, isError: review.isError ?? context.isError }, signal);
@@ -253,6 +309,7 @@ export function createSessionService({
     entry = {
       id: session.sessionId,
       sessionTools,
+      readSourceLanguage:languageReader,
       automated: Boolean(automated || writeRoots),
       session,
       ctx,

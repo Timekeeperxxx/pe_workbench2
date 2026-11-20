@@ -128,6 +128,7 @@ export function attachSessionEvents(entry, { bus, onMaterialSaved = () => {}, on
         }
         publish({
           type: "tool.completed",
+          ...(entry.activeTurn?.plan && entry.activeTurn.plan.route!=='ordinary'?{sourceTurn:true}:{}),
           id: event.toolCallId,
           name: event.toolName,
           status: failed ? "error" : "done",

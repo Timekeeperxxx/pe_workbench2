@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { EventEmitter, once } from "node:events";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -338,8 +339,9 @@ await test("durable delivery through Workbench, Pi, legacy SSE and AG-UI replay"
 
 async function networkRequest(base, pathname, body, signal) {
   const response = await fetch(base + pathname, {
+    headers: {"X-PE-Source-Links":"exact-v1", ...(body===undefined?{}:{"content-type":"application/json"})},
     method: body === undefined ? "GET" : "POST", signal,
-    ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   assert.ok(response.ok, `${pathname} returned ${response.status}`);
   return response;
@@ -408,6 +410,7 @@ sys.stdout.buffer.write(data.getvalue())
   const updated = workbook(942);
   const coldCases = [];
   const coldTraces = [];
+  const contracts = [];
   const original = `最终稿B（字段名 isError）依据 [${filename}]Model!B2。`;
   const historical = `历史检索命中。那条正式回答引用的是 [${filename}]Model!B2。`;
   const internal = "用户还没有看到这份草稿";
@@ -647,7 +650,7 @@ sys.stdout.buffer.write(data.getvalue())
         const cases = [
           { ending: "逗号分隔的第二词尚未查询", answer: idReport, badArgs: {}, partial: true, gap: "折旧政策",
             question: `请在第1轮分别查询两个词：“${queries[0]}”，“折旧政策”。分别说明两个词的检索结果和历史出处，列出命中的完整引用 ID。`, inspect: true },
-          { ending: "只看另一本工作簿", answer: idReport, badArgs: {}, partial: true, gap: "Budget13.xlsx",
+          { ending: "只看另一本工作簿", answer: idReport, badArgs: {}, reject: true, gap: "Budget13.xlsx",
             question: `请在第1轮查询“${queries[0]}”。这次只看工作簿 Budget13.xlsx 的历史出处，请给出单元格、材料版本和完整引用 ID。`, inspect: true },
           { ending: "命中该条 citation 带的完整引用", answer: `第1轮回答引用的是 [${filename}]Model!B2，材料 ${filename}（materialId ${book.material.id}，version 1），命中该条 citation 带的完整引用 ID 为 \`${citationId}\`。`, inspect: true },
           { ending: "这篇回答命中的 citation.id", answer: `第1轮回答引用的出处是：[${filename}]Model!B2，材料 ID 为 ${book.material.id}，版本 v1；这篇回答命中的 citation.id 是 ${citationId}。`, inspect: true },
@@ -733,14 +736,59 @@ sys.stdout.buffer.write(data.getvalue())
             assert.deepEqual(publicAnswer((await snapshot())[index]), publicAnswer(delivered));
             await checkReply(ui, delivered, index);
             if (peer) {
-              await openOriginalCell(peer.page, await checkReply(peer, delivered, index), book.material.id);
+              const peerBody=await checkReply(peer,delivered,index);
+              if (delivered.citations.length) await openOriginalCell(peer.page,peerBody,book.material.id);
+              else assert.equal(await peerBody.locator('[data-cell-cite]').count(),0);
               await ui.reload(id);
               const body = await checkReply(ui, delivered, index);
               if (ending.startsWith("真实")) assert.equal(await body.locator("[data-cell-cite]").count(), 2);
-              await openOriginalCell(ui.page, body, book.material.id);
+              if (delivered.citations.length) await openOriginalCell(ui.page, body, book.material.id);
+              else assert.equal(await body.locator('[data-cell-cite]').count(),0);
             }
           });
         }
+        if (history==='managed') await t.test('bound historical and current occurrences, exhaustive zero, and next search',async()=>{
+          const sid=book.material.id, citation=first.citations[0].id;
+          const prompt='请在第1轮分别查“最终稿B”和“折旧政策”是否引用 Acceptance13.xlsx。逐项说有无，命中给原格、版本和完整 ID。如果第一项有，再给这本书现在同一格的坐标、版本和读数。';
+          const text='第1轮正式回答引用的是 [Acceptance13.xlsx]Model!B2（版本 v1）。\n\n完整 citation.id：'+citation+
+            '\n\n第1轮“折旧政策”未命中。\n\n本次读取同一材料 v2 的 Model!B2，值为 942。';
+          const prior=(await snapshot()).length;
+          const script=scriptModel(entry,[
+            {toolName:'transcript_search',tool:{},toolId:'r2-failed',stopReason:'toolUse'},
+            {toolName:'transcript_search',tool:{query:'最终稿B',turn:1},toolId:'r2-X',stopReason:'toolUse'},
+            {toolName:'transcript_search',tool:{query:'折旧政策',turn:1},toolId:'r2-Y',stopReason:'toolUse'},
+            {tool:{path:book.path,query:'Model!B2'},toolId:'r2-current',stopReason:'toolUse'},
+            {text,pause:true},{text}
+          ]);
+          t.after(script.resume);
+          await ui.send(prompt);await bounded(script.paused,'source contract tools');const pending=entry.postAnswerRun;
+          script.resume();const record=await bounded(pending,'source contract signing');
+          assert.deepEqual([record.status,record.text],['completed',text],JSON.stringify(record));
+          const at=await checkReply(ui,record,prior);
+          const buttons=at.locator('[data-cell-cite]');
+          assert.deepEqual(await buttons.evaluateAll(nodes=>nodes.map(n=>n.dataset.version)),['1','2']);
+          for(const [i,value] of ['317','942'].entries()) {
+            await buttons.nth(i).click();await ui.page.waitForFunction(v=>document.querySelector('.xlsx-c.is-sel')?.innerText===v,value);
+            assert.deepEqual(await ui.page.evaluate(()=>[state.openFileId,state.selectedVersion]),[sid,i+1]);
+            await ui.page.locator('#dClose').click();
+          }
+          const offered='第'+(prior+1)+'轮正式回答引用的是 [Acceptance13.xlsx]Model!B2（版本 v1），引用 ID 为 '+citation+'。';
+          const next=scriptModel(entry,[{toolName:'transcript_search',tool:{query:citation,turn:prior+1},toolId:'r2-T3',stopReason:'toolUse'},
+            {text:offered,pause:true},{text:offered}]);t.after(next.resume);
+          await ui.send('请查第'+(prior+1)+'轮引用的完整 ID “'+citation+'” 的历史出处。');
+          await bounded(next.paused,'next source search');
+          const result=branch().findLast(e=>e.message?.toolCallId==='r2-T3').message.details;
+          const match=result.matches.find(m=>m.sourceTurnId===record.turnId);
+          assert.equal(match.sourceStatus,'completed');assert.ok(match.sourceClaims.some(c=>c.relation==='historical'));
+          const nextRun=entry.postAnswerRun;next.resume();const third=await bounded(nextRun,'next source delivery');
+          assert.deepEqual([third.status,third.text],['completed',offered],JSON.stringify(third));
+          const legacy=await (await fetch(base+'/api/sessions/'+id+'/state')).json();
+          const legacyCopy=legacy.messages.find(m=>m.turnId===record.turnId && m.role==='assistant');
+          assert.deepEqual([legacyCopy.text,legacyCopy.citations],[text,[]]);
+          const oldHit=JSON.parse(legacyCopy.tools.find(t=>t.id==='r2-X').output).matches[0];
+          assert.deepEqual(oldHit.citations,[]);assert.ok(oldHit.excerpt.includes(citation));
+          contracts.push({id,sid,prior,record,transport,db:ctx.store.db.prepare('PRAGMA database_list').all().find(r=>r.name==='main').file});
+        });
       });
     }
   }
@@ -765,6 +813,26 @@ sys.stdout.buffer.write(data.getvalue())
           const body = await checkReply(ui, record, index);
           if (record.status === "completed") await openOriginalCell(ui.page, body, materialId);
         }
+      });
+    }
+    assert.equal(contracts.length,2);
+    for (const {id,sid,prior,record,transport,db} of contracts) {
+      await t.test('signed source availability after v1 removal: '+transport,async t=>{
+        const ui=await open(t,transport,origin);
+        await ui.select(id);
+        const local=new DatabaseSync(db);
+        try {assert.equal(local.prepare('DELETE FROM material_versions WHERE material_id=? AND v=1').run(sid).changes,1);}
+        finally {local.close();}
+        await ui.reload(id);
+        const body=await checkReply(ui,record,prior);
+        await body.locator('[data-cell-cite]').first().click();
+        await ui.page.locator('#dPreview').getByText('无法打开引用的原版本。').waitFor();
+        await ui.page.locator('#dClose').click();
+        const card=answers(ui.page).nth(prior).locator('.tool-group');
+        await card.locator(':scope > summary').click();
+        const hit=card.locator('[data-tool-call-id="r2-X"]');
+        await hit.locator('[data-cell-cite]').click();
+        await ui.page.locator('#dPreview').getByText('无法打开引用的原版本。').waitFor();
       });
     }
   };
@@ -929,7 +997,7 @@ async function browserDeliveryTests(t, browser, app, base, json, restart) {
       const steps = [{ text }];
       if (index === 0) steps.unshift({ toolName: "write", stopReason: "toolUse", tool: { path: statePath,
         content: JSON.stringify({ presentation: { verdict: { text: verdict, status: "初始状态" } } }) } });
-      if (index === 2) steps.unshift({ toolName: "edit", stopReason: "toolUse", tool: { path: statePath, edits: [
+      if (index === 2) steps.unshift({toolName:"read",stopReason:"toolUse",tool:{path:statePath}}, { toolName: "edit", stopReason: "toolUse", tool: { path: statePath, edits: [
         { oldText: "早先框架判断", newText: verdict },
         { oldText: "初始状态", newText: "更新状态" },
       ] } });
@@ -976,7 +1044,7 @@ async function browserDeliveryTests(t, browser, app, base, json, restart) {
       { text: "另一框架正文。", verdict: "另一份框架", pending: false, steps: [
         { toolName: "write", stopReason: "toolUse", tool: { path: otherPath, content: content("另一份框架") } },
       ] },
-      { text: "更新框架正文。", verdict: "第三版判断", pending: false, steps: [edit("新判断", "第三版判断")] },
+      { text: "更新框架正文。", verdict: "第三版判断", pending: false, steps: [read, edit("新判断", "第三版判断")] },
       { text: "普通聊天正文。", steps: [] },
     ];
     async function checkCard(index) {

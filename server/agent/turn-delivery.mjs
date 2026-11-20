@@ -8,7 +8,7 @@ const START = "pe_turn_started";
 const DELIVERY = "pe_turn_delivery";
 const ACTIVE = "pe_turn_active";
 
-function appendMarker(session, type, data) {
+export function appendTurnMarker(session, type, data) {
   const manager = session.sessionManager;
   const file = manager?.getSessionFile?.();
   try {
@@ -25,6 +25,8 @@ function appendMarker(session, type, data) {
     memoryMarkers.set(session, markers);
   }
 }
+
+const appendMarker = appendTurnMarker;
 
 export function turnTimeline(session) {
   let entries = session.sessionManager?.getBranch?.();
@@ -43,11 +45,13 @@ export function turnTimeline(session) {
     if (item.type === "custom_message") {
       timeline.push({ kind: "message", message: { role: "custom", customType: item.customType } });
     }
-    if (item.type === "message") timeline.push({ kind: "message", message: item.message });
+    if (item.type === "message") timeline.push({ kind: "message", entryId:item.id, message: item.message });
     if (item.type !== "custom") continue;
     if (item.customType === START) timeline.push({ kind: "start", turn: item.data });
+    if (item.customType === 'pe_source_plan') timeline.push({kind:'plan',plan:item.data});
     if (item.customType === ACTIVE) timeline.push({ kind: "active", turnId: item.data.turnId });
     if (item.customType === DELIVERY) timeline.push({ kind: "delivery", record: item.data });
+    if (item.customType === "pe_source_cancel") timeline.push({kind:"cancel-intent",turnId:item.data.turnId});
     if (item.customType === "pe_answer_lint") timeline.push({ kind: "lint", data: item.data });
   }
   return timeline;
@@ -70,11 +74,11 @@ export function startTurn(entry, turn) {
       unlinkSync(temp);
     }
   }
-  appendMarker(entry.session, START, turn);
+  appendTurnMarker(entry.session, START, turn);
 }
 
 export function activateQueuedTurn(entry, turnId) {
-  appendMarker(entry.session, ACTIVE, { turnId });
+  appendTurnMarker(entry.session, ACTIVE, { turnId });
 }
 
 // First terminal decision wins. The read/append pair is synchronous, under the
@@ -83,6 +87,8 @@ export function saveTurnDelivery(entry, record) {
   const timeline = turnTimeline(entry.session);
   const existing = timeline.find(item => item.kind === "delivery" && item.record.turnId === record.turnId);
   if (existing) return existing.record;
+  const start=timeline.find(item=>item.kind==='start' && item.turn.turnId===record.turnId)?.turn;
+  if (start?.sourceSchema===1) record=finalizeSourceTurn(timeline,record);
   try {
     appendMarker(entry.session, DELIVERY, record);
   } catch (error) {
@@ -94,20 +100,39 @@ export function saveTurnDelivery(entry, record) {
   return record;
 }
 
+// Adjudicate every managed outcome inside the existing synchronous single writer.
+function finalizeSourceTurn(timeline,record) {
+  const cancelled=timeline.some(i=>i.kind==='cancel-intent' && i.turnId===record.turnId);
+  if (cancelled) return {...record,status:'cancelled',reason:'用户已取消本次回答。'};
+  const plan=timeline.findLast(i=>i.kind==='plan' && i.plan.turnId===record.turnId)?.plan;
+  if (record.status==='failed' || record.status==='cancelled' || plan?.route==='ordinary') return record;
+  if (!plan || record.sourceDelivery?.schema!==1 || record.sourceDelivery.planRev!==plan.rev) {
+    return {...record,status:'failed',text:'',citations:[],sourceDelivery:undefined,reason:'请求计划或对应的已核实正文缺失。'};
+  }
+  return record;
+}
+
 export function recoverInterruptedTurns(entry) {
   const timeline = turnTimeline(entry.session);
+  const cancelled = new Set(timeline.filter(item=>item.kind==="cancel-intent").map(item=>item.turnId));
   const delivered = new Set(timeline.filter(item => item.kind === "delivery").map(item => item.record.turnId));
   for (const item of timeline) {
     if (item.kind === "start" && !delivered.has(item.turn.turnId)) {
       saveTurnDelivery(entry, {
-        version: 1, turnId: item.turn.turnId, ...(item.turn.runId ? { runId: item.turn.runId } : {}), status: "failed", text: "", citations: [],
-        reason: "服务在回答交付前中断。", finishedAt: new Date().toISOString(),
+        version: 1, turnId: item.turn.turnId, ...(item.turn.runId ? { runId: item.turn.runId } : {}), status: cancelled.has(item.turn.turnId)?"cancelled":"failed", text: "", citations: [],
+        reason: cancelled.has(item.turn.turnId)?"用户已取消本次回答。":"服务在回答交付前中断。", finishedAt: new Date().toISOString(),
       });
     }
   }
 }
 
 export async function cancelActiveTurn(entry) {
-  if (entry.activeTurn) entry.activeTurn.cancelled = true;
+  const active=entry.activeTurn;
+  if (active && !active.cancelled) {
+    if (active.sourceSchema && !turnTimeline(entry.session).some(r=>r.kind==='delivery' && r.record.turnId===active.turnId))
+      appendTurnMarker(entry.session,'pe_source_cancel',{turnId:active.turnId});
+    active.cancelled=true;
+    active.controller?.abort();
+  }
   await entry.session.abort();
 }

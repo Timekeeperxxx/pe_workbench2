@@ -570,7 +570,7 @@ async function refreshSnapshot({
   const id = state.activeSession;
   if (!id) return null;
   try {
-    const snap = await api(`/api/sessions/${id}/state`);
+    const snap = await api(`/api/sessions/${id}/state?sourceLinks=exact-v1`);
     if (state.activeSession !== id) return null;
     if (guard && !guard()) return null;
     if (snap?.sessionId !== id || !Array.isArray(snap.messages) || typeof snap.streaming !== 'boolean') {

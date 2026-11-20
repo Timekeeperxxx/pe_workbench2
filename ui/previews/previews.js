@@ -1978,7 +1978,15 @@ function closeFile(restoreFocus = true) {
 function renderFileDialog() {
   const f = fileById(state.openFileId);
   if (!f) return;
-  const v = f.versions.find(x => x.v === state.selectedVersion) || latest(f);
+  const selected=f.versions.find(x=>x.v===state.selectedVersion);
+  if (!selected && previewState.requestedLocator) {
+    resetPreview();
+    $('#dName').textContent=f.name;
+    $('#dMeta').textContent='原 v'+state.selectedVersion+' 不可用';
+    $('#dPreview').textContent='无法打开引用的原版本。';
+    return;
+  }
+  const v = selected || latest(f);
   const k = kindOf(f.name);
   const st = STATUS[f.status] || STATUS.draft;
 

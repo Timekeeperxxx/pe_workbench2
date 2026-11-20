@@ -4,15 +4,19 @@ import { buildTurnContext, checkTurnTools } from '../../lib/turn-context.mjs';
 import { pendingMerges, readLedger, readLedgerSync } from '../../lib/ledger.mjs';
 import { recordUserClaims } from '../../lib/claim-detect.mjs';
 import { randomUUID } from 'node:crypto';
+import { prepareSourcePlan, digest } from './source-plan.mjs';
+import { sourceObservations } from './source-observations.mjs';
+import { evaluateSourceDraft } from './source-delivery.mjs';
 import { lintAnswer, lintLedgerAnswer, answerStats, asksDeviationQuestion, contextModelTarget } from '../../lib/answer-lint.mjs';
 import { collectCitationsFromToolCalls, currentCitation, rehydrateCitations, toolEvidenceState } from '../../lib/citations.mjs';
+import { extractLocatorMatches } from '../../lib/citation-locator.mjs';
 import { validCitations } from '../../lib/contracts/citation.mjs';
 import { markStaleVersions, registerToolResult } from '../../lib/fact-register.mjs';
 import { frameworkForTurn, textOfContent } from './snapshot.mjs';
 import { indexJson, locateChatTopics, recentTopicDialogue } from './topic-locator.mjs';
 import { updateTopicsFromFacts } from '../../lib/topic-index.mjs';
 
-import { activateQueuedTurn, startTurn, saveTurnDelivery } from './turn-delivery.mjs';
+import { activateQueuedTurn, startTurn, saveTurnDelivery, appendTurnMarker } from './turn-delivery.mjs';
 import { sourceSearchGap } from './transcript-search-recovery.mjs';
 import { adoptedCitations, asksHistoricalSource, answerBlocks, answerGaps, blockingFinding, reportedLocatorEvidence, joinContinuation, verifiedPortion, workbookItemCoverage } from './answer-delivery.mjs';
 import { presentUserAnswer } from '../../ui/chat/user-facing-answer.js';
@@ -25,7 +29,7 @@ export function runWithPostAnswer(entry, text, options = {}, broadcast = () => {
     : text;
   if (entry.automated) return entry.session.prompt(prompt, promptOptions);
   const previous = entry.postAnswerRun;
-  const turn = { turnId: randomUUID(), question: text, startedAt: new Date().toISOString() };
+  const turn = { turnId: randomUUID(), question: text, sourceSchema: 1, startedAt: new Date().toISOString() };
   if (runId) turn.runId = runId;
   if (previous) turn.queued = true;
   startTurn(entry, turn);
@@ -33,10 +37,14 @@ export function runWithPostAnswer(entry, text, options = {}, broadcast = () => {
   const execute = async () => {
     if (turn.queued) activateQueuedTurn(entry, turn.turnId);
     entry.managedChat = true;
-    const active = entry.activeTurn = { ...turn, attachments, cancelled: false };
+    const active = entry.activeTurn = { ...turn, attachments, cancelled: false, controller:new AbortController(), budget:{started:Date.now(),business:0,side:0,input:0,output:0,requests:[]}, rawDrafts:[] };
+    active.receipt=(type,data)=>appendTurnMarker(entry.session,type,{...data,turnId:active.turnId});
     broadcast({ type: 'turn.started', turnId: turn.turnId, question: text, startedAt: turn.startedAt });
     let outcome;
     try {
+      active.plan = await prepareSourcePlan(active,entry);
+      appendTurnMarker(entry.session,'pe_source_plan',active.plan);
+      active.admitted = true;
       outcome = await generateAnswer(entry, prompt, promptOptions, active);
     } catch (error) {
       outcome = { status: 'failed', text: '', citations: [], reason: failureReason(error) };
@@ -95,6 +103,7 @@ async function generateAnswer(entry, promptText, options, active) {
   let safeText = '';
   let safeCitations = [];
   const interrupted = reason => ({
+    ...(active.safeDecision || {}),
     status: active.cancelled ? 'cancelled' : safeText ? 'partial' : 'failed',
     text: safeText, citations: safeCitations, reason: failureReason(reason),
   });
@@ -114,7 +123,7 @@ async function generateAnswer(entry, promptText, options, active) {
   const correctionIds=(ledgerBefore?.facts||[]).filter(f=>f.source==='user_correction'&&f.turn===turn&&f.status==='current').map(f=>f.id);
   if(correctionIds.length) await updateTopicsFromFacts(entry.ctx?.root,entry.id,{factIds:correctionIds}).catch(()=>[]);
   const locator = input => locateChatTopics(entry.indexModel, input, entry.modelPayload);
-  const context = await buildTurnContext({ question: text, history:priorDialogue, root: entry.ctx?.root, sessionId: entry.id, factMemory:entry.ctx?.factMemory, locator:ledgerBefore?.topics?.length?locator:undefined });
+  const context = await buildTurnContext({ question: text, history:priorDialogue, root: entry.ctx?.root, sessionId: entry.id, factMemory:entry.ctx?.factMemory, locator:active.plan.route==='ordinary' && ledgerBefore?.topics?.length?locator:undefined });
   // DT-8: opt-in delivery checklist only. Empty/absent keeps old behavior.
   const requiredSections = Array.isArray(options.requiredSections)
     ? options.requiredSections
@@ -132,12 +141,13 @@ async function generateAnswer(entry, promptText, options, active) {
     if (event.type === 'tool_execution_end') {
       const call = toolCalls.findLast(c => c.id === event.toolCallId);
       if (call) {
+        call.finishedAt=Date.now();
         call.details = event.result?.details; call.result=event.result;
         call.success = event.isError === false && toolEvidenceState(event.result) !== 'failed';
         if(call.success) registrationJobs.push(registerToolResult(entry.ctx?.root,entry.id,call,{turn}).catch(()=>[]));
       }
     }
-    if (event.type === 'agent_settled' && event.aborted) active.cancelled = true;
+    if (event.type === 'agent_settled' && event.aborted && active.plan.route === 'ordinary') active.cancelled = true;
   });
   try {
     const priorCitations = Array.isArray(entry.citationIndex) ? entry.citationIndex : [];
@@ -149,7 +159,7 @@ async function generateAnswer(entry, promptText, options, active) {
     await entry.session.prompt(promptText, options);
     for (;;) {
       const message = latestMessage || entry.session.messages.slice(boundary).findLast(item => item.role === 'assistant');
-      if (message?.stopReason === 'aborted') active.cancelled = true;
+      if (message?.stopReason === 'aborted' && active.plan.route === 'ordinary') active.cancelled = true;
       if (active.cancelled) return interrupted('用户已取消本次回答。');
       if (!['length', 'stop'].includes(message?.stopReason)) {
         const failedTool = toolCalls.findLast(call => !call.success);
@@ -165,8 +175,8 @@ async function generateAnswer(entry, promptText, options, active) {
       const messages = entry.session.messages.slice(turnBoundary);
       for (const [index, m] of messages.entries()) for (const c of Array.isArray(m.content) ? m.content : []) {
         if (c.type !== 'toolCall') continue;
-        const result = messages.find(r => r.role === 'toolResult' && r.toolCallId === c.id);
-        scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, argumentsError: c.argumentsError, success: Boolean(result) && result.isError === false && toolEvidenceState(result) !== 'failed', details:result?.details, result });
+        const copies = messages.filter(r => r.role === 'toolResult' && r.toolCallId === c.id);
+        for (const result of copies.length ? copies : [null]) scanned.push({ messageIndex: turnBoundary + index, id:c.id, name: c.name, args: c.arguments, argumentsError: c.argumentsError, success: Boolean(result) && result.isError === false && toolEvidenceState(result) !== 'failed', details:result?.details, result });
       }
       for(const call of scanned) if(call.success) registrationJobs.push(registerToolResult(entry.ctx?.root,entry.id,call,{turn}).catch(()=>[]));
       const registered= (await Promise.all(registrationJobs)).flat().filter(Boolean);
@@ -195,7 +205,7 @@ async function generateAnswer(entry, promptText, options, active) {
       }
       for (const [id, version] of observedVersions) currentVersions[id] ??= version;
       await markStaleVersions(entry.ctx?.root,entry.id,currentVersions).catch(()=>0);
-      if(registered.length) await updateTopicsFromFacts(entry.ctx?.root,entry.id,{factIds:registered.map(f=>f.id),proposer:async({topic,facts})=>indexJson(entry.indexModel,`根据已核事实提出一个用于检索的主题标题、摘要和 binding。摘要不得添加事实数字，只描述指标和期间。严格 JSON 输出 {"title":"...","summary":"...","binding":{...}}。候选主题:${JSON.stringify(topic)}\n已核事实:${JSON.stringify(facts.map(f=>({id:f.id,claim:f.claim,binding:f.binding,period:f.period})))}`,entry.modelPayload)}).catch(()=>[]);
+      if(registered.length && active.plan.route==='ordinary') await updateTopicsFromFacts(entry.ctx?.root,entry.id,{factIds:registered.map(f=>f.id),proposer:async({topic,facts})=>indexJson(entry.indexModel,`根据已核事实提出一个用于检索的主题标题、摘要和 binding。摘要不得添加事实数字，只描述指标和期间。严格 JSON 输出 {"title":"...","summary":"...","binding":{...}}。候选主题:${JSON.stringify(topic)}\n已核事实:${JSON.stringify(facts.map(f=>({id:f.id,claim:f.claim,binding:f.binding,period:f.period})))}`,entry.modelPayload)}).catch(()=>[]);
       const turnCitations = rehydrateCitations({register:refreshedLedger,answer,thisTurnCitations,currentVersions,toolCalls:calls});
       entry.citationIndex = turnCitations;
       const lintContext = { ...baseLintContext, question:text, citations: turnCitations, toolCalls: calls, currentVersions, ...(priorCitations.length ? { priorCitations } : {}) };
@@ -226,6 +236,61 @@ async function generateAnswer(entry, promptText, options, active) {
           ...checkTurnTools({ answer: candidate, routes: context.routes, toolCalls: calls }),
         ];
       };
+      if (active.plan.route !== 'ordinary') {
+        const meaning=await entry.readSourceLanguage?.('claims',{answer,units:answerBlocks(answer).flatMap(b=>b.parts)},active);
+        const observations=sourceObservations(active.plan,scanned,toolCalls,entry.ctx?.store);
+        const sourceVersions={...currentVersions};
+        if (entry.ctx?.store?.getVersionRow) for (const w of observations.witnesses) {
+          const id=w.citation.materialId;
+          sourceVersions[id]=entry.ctx.store.getVersionRow(id)?.version?.v ?? null;
+        }
+        const scopedLint=(part,pool)=>{
+          const checks={...lintContext,locatorCitations:pool};
+          const local=lintAnswer(part,checks);
+          return [...local,...lintFactIdentity(part,entry.ctx?.factMemory,{question:text}),
+            ...lintLedgerAnswer(part,refreshedLedger,{...checks,locatorFindings:local.filter(f=>f.rule==='unverified_locator')}),
+            ...checkTurnTools({answer:part,routes:context.routes,toolCalls:calls})];
+        };
+        const evaluated=evaluateSourceDraft({text:answer,question:text,plan:active.plan,observations,currentVersions:sourceVersions,
+          meaning,review:active.reviewed,lint:scopedLint});
+        const {hostRepair,rejected,...decision}=evaluated;
+        const incomplete = message.stopReason==='length' || (observations.items.some(i=>i.hits.length || i.related.length) && lintAnswer(answer,lintContext).some(f=>f.rule==='incomplete' &&
+          !(f.message==='句末可能截断' && (decision.sourceDelivery.items.some(i=>i.fieldsDelivered.includes('id')) || /未核验[：:]无$/.test(answer)))));
+        const trace={turnId,attempt:correctionCount+continuationCount,raw:active.rawDrafts.slice(),meaning:meaning?.claims,requests:active.budget?.requests,languageErrors:active.languageErrors,reviewed:digest(delta),
+          assembled:digest(joined),presented:digest(answer),final:decision.sourceDelivery.textDigest,
+          correctionCount,continuationCount,hostRepair,stopReason:message.stopReason};
+        appendTurnMarker(entry.session,'pe_source_observation',{turnId,attempts:observations.attempts.map(({details,...c})=>c),
+          conflicts:observations.badIds});
+        appendTurnMarker(entry.session,'pe_source_draft',trace);
+        const lintRecord={version:1,turnId,timestamp:new Date().toISOString(),correctionCount,continuationCount,
+          citations:decision.citations,findings:rejected.map(excerpt=>({rule:'unverified_locator',severity:'error',excerpt,
+            message:'来源陈述与当前可用证据不符'})),messageIndex:entry.session.messages.lastIndexOf(message)};
+        appendTurnMarker(entry.session,'pe_answer_lint',lintRecord);
+        entry.answerLint=lintRecord;
+        safeText=decision.text;
+        safeCitations=decision.citations;
+        active.safeDecision=decision;
+        if (active.cancelled) return {...decision,status:'cancelled',reason:'用户已取消本次回答。'};
+        const needsCorrection=rejected.length && (observations.items.some(i=>i.hits.length || !i.item.query && !i.item.book) || !observations.attempts.some(c=>c.name==='transcript_search') && observations.witnesses.some(w=>w.relation==='read')) &&
+          (!observations.recoveryGaps.length || rejected.some(s=>extractLocatorMatches(s).length || /[0-9]/.test(s))) &&
+          !(observations.items.length>1 && (observations.recoveryGaps.length || observations.items.some(i=>i.empty) || decision.status==='partial' && rejected.every(s=>!/cite:|!\$?[A-Z]+\$?\d+/i.test(s))));
+        if (!incomplete && (!needsCorrection || correctionCount>=1)) return decision;
+        const extend=incomplete && continuationCount<1;
+        if (!extend && (!needsCorrection || correctionCount>=1)) {
+          return {...decision,status:decision.text?'partial':'failed',reason:decision.reason||'回答在交付前中断。'};
+        }
+        if (extend) continuationCount++; else correctionCount++;
+        continuationPrefix=extend?joined:null;
+        active.continueResearchAnswer=extend?more=>joinContinuation(joined,more):null;
+        latestMessage=null;
+        boundary=entry.session.messages.length;
+        const content=extend?'上一条回答在句中截断，请从断点继续补完，不要重复已写内容。':
+          '请重新回答原问题。以下陈述的身份、适用时间或出处未能核实：'+rejected.join('；')+'。请核对本轮真实结果，保留有依据的部分。';
+        if (entry.session.sendCustomMessage) await entry.session.sendCustomMessage({customType:extend?'pe_answer_continue':'pe_answer_correct',
+          content,display:false,details:{turnId,correctionCount,continuationCount}},{triggerTurn:true});
+        else await entry.session.prompt(content,{peInternal:true});
+        continue;
+      }
       const findings = findingsFor(answer);
       const adopted = adoptedCitations(answer, available);
       const adoptedIds = new Set([...adopted.map(citation => citation.id), ...coverage.evidenceIds]);

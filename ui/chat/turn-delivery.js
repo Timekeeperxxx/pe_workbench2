@@ -28,6 +28,7 @@ export function receiveDelivery(state, record) {
   const message = {
     role: 'assistant', turnId: record.turnId, text: record.text || '',
     citations: record.citations || [], status: record.status, reason: record.reason,
+    ...(record.sourceDelivery ? {sourceDelivery:record.sourceDelivery} : {}),
     finishedAt: record.finishedAt, tools: tools.map(tool => tool.status === 'running' ? { ...tool, status: 'error' } : tool),
     ...(record.analysisState ? {
       analysisState: record.analysisState, analysisStatePath: record.analysisStatePath, turnStartedAt: record.turnStartedAt,

@@ -60,7 +60,7 @@ export function openAgentStream(sessionId, onEvent, { onError = () => {} } = {})
   // falling back to the legacy SSE stream.
   if (getState().agentTransport !== "legacy") return null;
   const projectId = getState().project?.id;
-  const stream = new EventSource(withProject(`/api/sessions/${encodeURIComponent(sessionId)}/events`));
+  const stream = new EventSource(withProject(`/api/sessions/${encodeURIComponent(sessionId)}/events?sourceLinks=exact-v1`));
   agentStream = stream;
   getState().es = stream;
   stream.onmessage = (event) => {

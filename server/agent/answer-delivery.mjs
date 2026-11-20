@@ -25,7 +25,7 @@ const PRESENT = /当前|目前|现在|最新|现行|现为|(?:截至|截止|直�
 const SOURCE_CLAUSE_BREAK = new RegExp(String.raw`[；;]|[，,](?=\s*(?:而|但)?(?:同一|该|这份)?(?:材料|文件|工作簿)?(?:${PRESENT.source}))`, 'i');
 // Check descriptive fields against the source of the written locator. Keep the
 // original answer and its qualifiers intact for lint, delivery and linking.
-function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
+export function checkSourceFields(clause, refs, lookup, precedingSource, ids) {
   const resolved = refs.map(ref => resolveLocatorToken(ref.raw, lookup)?.citation);
   let conflict = '';
   let hasFields = false;
@@ -122,7 +122,7 @@ const SOURCE_WORDS = new RegExp([
 // other assertion for the source and financial checks below.
 const SEARCH_TERMS = /\bcitations?\b|transcript_search|命中项?|匹配项?|检索|搜索|查询|工具|结果|返回|提供|给出|携带|附带|随附|所附|条/gi;
 const SOURCE_POINTER = /(?:这(?:条|个|一)?|该|其|此|上述|前述)(?:引用|出处|来源|记录)(?:所)?(?:指向|指的(?:是)?|对应(?:于)?)/;
-function sourceFieldsOnly(part, hasId) {
+export function sourceFieldsOnly(part, hasId) {
   if (hasId) {
     part = part.replace(/(?:这|那|该|此)一?(?:篇|条|份|则|个)(?=\s*(?:正式|回答|答文|回复|记录|命中|引用|citation))/gi, '')
       .replace(/(?:由)?[他她它](?:所)?(?=引用|援引|提供|返回|给出|携带)/g, '').replace(SEARCH_TERMS, '');
