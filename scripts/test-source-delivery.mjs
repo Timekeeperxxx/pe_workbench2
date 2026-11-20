@@ -395,6 +395,44 @@ test('a research receipt proves only the audited text and cannot complete a miss
   }
 });
 
+test('the first projection reserves the omission marker while preserving full original results', async () => {
+  const rows = [];
+  for (let i = 1; i <= 60; i++) {
+    const materialId = 'synthetic-' + i;
+    rows.push(
+      {role: 'user', content: '第' + i + '项'},
+      {
+        role: 'assistant',
+        content: 'sample ' + '材料正文'.repeat(180),
+        sourceTurnId: 'T' + i,
+        sourceStatus: 'partial',
+        sourceLimits: ['仅回答已核实的出处'],
+        citations: [
+          {
+            id: 'cite:' + materialId + ':v1:Model!B2',
+            materialId,
+            filename: materialId + '.xlsx',
+            version: 1,
+            locator: 'Model!B2',
+          },
+        ],
+      },
+    );
+  }
+  const active = {
+    admitted: true,
+    plan: {route: 'history', items: [{id: 'X', action: 'search', query: 'sample'}]},
+  };
+  const result = await createTranscriptSearchTool({getMessages: () => rows, getActive: () => active}).execute(
+    'large',
+    {query: 'sample', limit: 50},
+  );
+  assert.ok(result.content[0].text.length <= 12000);
+  assert.equal(JSON.parse(result.content[0].text).sourceEvidenceOmitted, true);
+  assert.equal(result.details.sourceEvidence.length, 50);
+  assert.equal(result.details.totalMatches, 60);
+});
+
 test('the provider receipt distinguishes final evidence fields, a handle-only projection and an omitted row', async () => {
   const active = {
     turnId: 'T2',
