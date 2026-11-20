@@ -1,7 +1,8 @@
 import { isWorkbookMetricName } from '../../lib/workbook-query.mjs';
 import { Lexer } from 'marked';
-import { adoptedCitations, citationLookup } from '../../lib/citations.mjs';
+import { adoptedCitations, citationLookup, currentCitation, toolEvidenceState } from '../../lib/citations.mjs';
 import { citationFilenames, citationIdentity, extractLocatorMatches, LOCATOR_SOURCE, locatorKey, maskCitationIds, resolveLocatorToken } from '../../lib/citation-locator.mjs';
+import { answerCharCount } from '../../lib/answer-length.mjs';
 export { adoptedCitations };
 
 // A search hit vouches for what an earlier answer cited. It supplies a
@@ -412,8 +413,10 @@ function requestedItems(question) {
 
 // Keep the original Markdown for delivery. A table row is a single claim
 // unit, just as a sentence is in prose. Its header belongs to the retained rows.
+const sentenceParts = raw => raw.split(/(?<=[。！？])|(?<=[.!?])(?=\s|$)|\n+/).map(s => s.trim()).filter(Boolean);
+
 export function answerBlocks(text) {
-  const prose = raw => ({ raw, parts: raw.split(/(?<=[。！？])|(?<=[.!?])(?=\s|$)|\n+/).map(s => s.trim()).filter(Boolean) });
+  const prose = raw => ({ raw, parts: sentenceParts(raw) });
   if (!text.includes('|')) return [prose(text)];
   return Lexer.lex(text).map(token => {
     if (token.type !== 'table') return prose(token.raw);
@@ -421,6 +424,155 @@ export function answerBlocks(text) {
     return { header: header + '\n' + separator, parts: rows,
       labels: token.header.map(cell => cell.text.replace(/[*`]/g, '').trim()), cells: token.rows };
   });
+}
+
+const summaryItems = [
+  ['置信度', /置信度/u, /置信度|判断信心/u],
+  ['最强证据', /最强证据/u, /^(?:最强|核心|主要)?证据$|^主要依据$/u],
+  ['反证', /反证/u, /反证|反向证据|最强挑战/u],
+  ['已修订的结论', /结论[^。]{0,14}(?:被修订|修订了)|修订了?哪些结论/u, /修订|下调与保留|调整的判断/u],
+  ['三项待核', /(?:三|3)项待核/u, /待核|待验证|还需核对/u],
+  ['下次行动', /下次行动|下一步行动/u, /下次行动|下一步|后续行动|复核计划/u],
+];
+const confidenceRating = /(?:置信度|判断信心)[\s*：:]*(?:为|是)?\s*(?:较?低|中等(?:偏[低高])?|中[低高]?|较?高)/u;
+
+export function requestedSummaryItems(question) {
+  if (!/摘要|纪要/u.test(question)) return [];
+  return summaryItems.filter(([, requested]) => requested.test(question)).map(([label]) => label);
+}
+
+function summaryHeading(label, requested) {
+  const clean = label.replace(/[#*：:\s]/gu, '');
+  return summaryItems.find(([item, , title]) => requested.includes(item) && title.test(clean))?.[0];
+}
+
+function answerHeading(text, required) {
+  const markdown = text.match(/^(#{1,6}[ \t]+[^\n]+)(?:\n([\s\S]*))?$/u) ||
+    text.match(/^(\*\*[^*\n]+\*\*[ \t]*[：:]?)[ \t]*([\s\S]*)$/u);
+  if (markdown) return markdown;
+  const plain = text.match(/^([^：:\n]{1,22}[：:])[ \t]*([\s\S]*)$/u);
+  return plain && summaryHeading(plain[1], required) ? plain : null;
+}
+
+function deliverySections(blocks, required = []) {
+  const sections = [];
+  for (const {header, parts} of blocks) {
+    let section = {header, table: Boolean(header), parts: []};
+    sections.push(section);
+    for (const part of parts) {
+      const heading = !header && answerHeading(part, required);
+      if (!heading) {
+        section.parts.push(part);
+        continue;
+      }
+      const body = heading[2]?.trim();
+      section = {header:heading[1], parts:body ? [body] : []};
+      sections.push(section);
+    }
+  }
+  return sections;
+}
+
+function reviewList(section) {
+  // Sentence splitting may separate a numeric marker ("1.") from its text.
+  const text = section.parts.join('\n').replace(/(^|[；;]\s*)([1-9][.．])\n(?=\S)/gmu, '$1$2 ');
+  const marker = /(?:^|[。；;：:\n])\s*(?:[1-9一二三四五六七八九][、．.)）]|[-*]\s+)\s*/u;
+  const marked = text.split(marker);
+  const items = marked.length > 1 ? marked.slice(1) : text.split(/[、；;\n]/u);
+  const substantive = items.map(part => part.trim().replace(/[。；;]+$/u, '')).filter(part => /[\p{L}]/u.test(part));
+  return { text, complete:substantive.length === 3 && new Set(substantive).size === 3 };
+}
+
+export function missingSummaryItems(answer, required) {
+  if (!required.length) return [];
+  const included = new Set();
+  for (const section of deliverySections(answerBlocks(answer), required)) {
+    const label = section.header && summaryHeading(section.header, required);
+    if (label === '三项待核' ? reviewList(section).complete : label && section.parts.some(part => /[\p{L}\p{N}]/u.test(part))) {
+      included.add(label);
+    }
+  }
+  if (confidenceRating.test(answer)) included.add('置信度');
+  return required.filter(label => !included.has(label));
+}
+
+function budgetBlocks(blocks, required) {
+  const listItem = /^(?:[-+*][ \t]+|(?:\d{1,2}[.．、)）]|[一二三四五六七八九十][、．)）])(?!\d))/u;
+  return blocks.map(block => {
+    if (block.header) return block;
+    const parts = [];
+    let paragraph = [];
+    for (const raw of block.raw.split('\n')) {
+      const line = raw.trim();
+      if (paragraph.length && (!line || listItem.test(line) || answerHeading(line, required))) {
+        parts.push(paragraph.join('\n'));
+        paragraph = [];
+      }
+      if (line) paragraph.push(line);
+    }
+    if (paragraph.length) parts.push(paragraph.join('\n'));
+    return { parts };
+  });
+}
+
+// Preserve a prose paragraph or list item as a unit, like a table row.
+// A sentence can explain the judgment just before it without restating it.
+export function reviewBodyWithinBudget(answer, blocks, budget, omit, required = [], wholeSections = []) {
+  if (!omit && answerCharCount(answer) <= budget) return answer;
+  const content = deliverySections(budgetBlocks(blocks, required), required).map(section => {
+    const label = section.header && summaryHeading(section.header, required);
+    const list = label === '三项待核' ? reviewList(section) : null;
+    const whole = wholeSections.includes(label);
+    const units = list ? (list.complete ? [list.text] : []) :
+      whole ? [section.parts.join('\n')] : section.parts;
+    const allowed = part => !omit?.(section.header ? `${section.header}\n${part}` : part);
+    const parts = units
+      // Corrections can still remove a conflicting claim without discarding
+      // independent sentences in the same paragraph. Budget selection uses
+      // the remaining paragraph as one unit.
+      .map(part => {
+        if (allowed(part)) return part;
+        return section.table || list || whole ? '' : sentenceParts(part).filter(allowed).join('\n');
+      })
+      .filter(Boolean)
+      .map(text => ({text, size:answerCharCount(text)}));
+    const rating = required.includes('置信度') && !label ? parts.find(part => confidenceRating.test(part.text)) : null;
+    return {
+      ...section, priority:list ? 2 : label || rating ? 1 : 0, parts, rating,
+      needsLead: Boolean(section.header && !section.table),
+    };
+  }).filter(section => section.parts.length);
+  const share = budget / content.length;
+  let used = 0;
+  const kept = new Set();
+  function add(section, part) {
+    if (kept.has(part)) return;
+    const size = part.size + (section.keptHeader ? 0 : answerCharCount(section.header || ''));
+    if (used + size > budget) return;
+    used += size;
+    kept.add(part);
+    section.keptHeader = true;
+  }
+  const ordered = content.toSorted((a, b) => Number(b.priority) - Number(a.priority));
+  for (const section of ordered) {
+    const allowance = share - answerCharCount(section.header || '');
+    const lead = section.parts[0];
+    const first = section.rating || (section.needsLead
+      ? ((section.priority || lead.size <= allowance) ? lead : null)
+      : section.parts.find(part => part.size <= allowance));
+    if (first) add(section, first);
+  }
+  for (const section of content) {
+    for (const part of section.parts) {
+      add(section, part);
+      // A shorter footnote cannot stand in for an omitted judgment.
+      if (section.needsLead && !section.keptHeader) break;
+    }
+  }
+  return content.flatMap(section => {
+    const body = section.parts.filter(part => kept.has(part)).map(part => part.text);
+    return body.length ? [[section.header, ...body].filter(Boolean).join('\n')] : [];
+  }).join('\n\n');
 }
 
 // Expand ordered values into named claims for verification. Delivery always
@@ -513,9 +665,37 @@ function verifiedSourceNote(part, source, requireId = false) {
   return fields.hasFields && (!requireId || fields.hasId) && !fields.conflict && !fields.idConflict && sourceFieldsOnly(fields.checked, fields.hasId);
 }
 
+export function hasOcrPageSource(part, calls, versions) {
+  const locators = /\bp\.\s*(\d+)\b|第\s*(\d+)\s*页/giu;
+  const pages = [...part.matchAll(locators)].map(match => Number(match[1] || match[2]));
+  if (!pages.length || /^\s*(?:[-*]\s*)?(?:未核验|待核实)/u.test(part)) return false;
+  // OCR can support a text summary. Amounts and percentages still need
+  // the numeric verification path, even if the OCR happens to contain them.
+  const content = part.replace(locators, '');
+  const quantities = content.replace(/^\s*\d+[.、]\s*/u, '')
+    .replace(/\b20\d{2}(?:\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?)?)?/gu, '');
+  if (/\d/.test(quantities)) return false;
+  const claims = [...content.matchAll(/\b20\d{2}\b/g)].map(match => match[0]);
+  const materialPages = new Map();
+  for (const call of calls) {
+    const d = call.result?.details || call.details;
+    if (call.name !== 'pdf_read' || !call.success || toolEvidenceState(call) !== 'success' ||
+        !d?.materialId || !currentCitation(d, versions)) continue;
+    if (/\.pdf\b/iu.test(part) && !part.includes(d.filename)) continue;
+    const source = materialPages.get(d.materialId) || new Map();
+    for (const page of d.evidence || []) {
+      if (page.ocr && page.text.trim()) source.set(page.page, page.text);
+    }
+    if (source.size) materialPages.set(d.materialId, source);
+  }
+  if (materialPages.size !== 1) return false;
+  const source = materialPages.values().next().value;
+  return pages.every(page => source.has(page)) && claims.every(year => pages.some(page => source.get(page).includes(year)));
+}
+
 // On exhaustion or interruption only release complete, separately sourced
 // sentences or table rows and their verified source fields.
-export function verifiedPortion(answer, blocks, reportFor, findingsFor, coverage) {
+export function verifiedPortion(answer, blocks, reportFor, findingsFor, coverage, ocrSource = () => false) {
   const verified = [];
   const anchors = [];
   let retainedAll = true;
@@ -526,7 +706,8 @@ export function verifiedPortion(answer, blocks, reportFor, findingsFor, coverage
       if (!eligible(part)) return false;
       const report = reportFor(part);
       const sourced = coverage.verifiedEndings.has(part) ||
-        (/[。！？.!?]$/.test(part) || report.endsWithIdField) && adoptedCitations(part, report.citations).length;
+        (/[。！？.!?]$/.test(part) || report.endsWithIdField) &&
+          (adoptedCitations(part, report.citations).length || ocrSource(part));
       if (!sourced || findingsFor(part).some(blockingFinding)) return false;
       if (report.historical?.length === 1) sources.set(index, report.historical[0].citation);
       return true;

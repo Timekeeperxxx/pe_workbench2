@@ -209,8 +209,13 @@ export function createSessionService({
         recordAudit,
         getSessionMessages: () => session.messages,
         getContinuation: () => entry?.activeTurn?.continueResearchAnswer,
-        audit: (source, model, context, options, draft) =>
-          auditResearch(source, model, context, options, draft, { workbookEvidence: researchReview.evidenceSnapshot() }),
+        getAnswerLengthHint: () => entry?.activeTurn?.answerLengthHint,
+        getCalculation: () => entry?.activeTurn?.calculation,
+        getCompactAnswer: () => entry?.activeTurn?.compactAnswer,
+        getPriorAnswers: () => entry?.activeTurn?.priorAnswers,
+        getPdfDisclosure: () => entry?.activeTurn?.pdfDisclosure,
+        audit: (source, model, context, options, draft, extra) =>
+          auditResearch(source, model, context, options, draft, { ...extra, workbookEvidence: researchReview.evidenceSnapshot() }),
         onContext: (model, context, options) => {
           researchReview.restoreEvidence(context.messages);
           researchReview.setAuditor(async (content, extra) => {
